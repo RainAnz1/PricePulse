@@ -1300,7 +1300,8 @@ export class SessionsController implements OnModuleInit {
     }
 
     const verified = await verifyJdCookiesWithLoginService(session.cookieHeader);
-    if (Object.keys(verified.refreshedCookies).length > 0 || verified.authenticated) {
+    const hasCoreAuthCookie = Boolean(session.cookies.thor || session.cookies.pt_key);
+    if (verified.authenticated || (hasCoreAuthCookie && Object.keys(verified.refreshedCookies).length > 0)) {
       const updated = savePersistedJdSession({
         ...session,
         pin: verified.pin || session.pin,
@@ -1329,8 +1330,8 @@ export class SessionsController implements OnModuleInit {
       };
     }
 
-    const cookieCount = Object.keys(session.cookies).length;
-    if (cookieCount > 0) {
+    if (hasCoreAuthCookie) {
+      const cookieCount = Object.keys(session.cookies).length;
       return {
         state: 'logged_in',
         nickname: session.nickname || session.pin || '京东已登录用户',
@@ -1346,10 +1347,10 @@ export class SessionsController implements OnModuleInit {
       };
     }
 
-    void notifySessionExpiredToFeishu('jd', '服务端京东 Cookie 已失效，请重新登录');
+    void notifySessionExpiredToFeishu('jd', '服务端京东核心登录 Cookie (thor) 已失效或缺失，请重新扫码登录');
     return {
       state: 'login_required',
-      message: '本地保存的京东登录态已失效，请重新登录',
+      message: '京东核心登录凭证 (thor) 缺失或已过期，请使用下方「京东扫码登录」重新扫码以同步完整服务端会话',
     };
   }
 
@@ -1879,7 +1880,8 @@ export class SessionsController implements OnModuleInit {
   @Get('taobao/status')
   async getTaobaoStatus() {
     const saved = loadPersistedTaobaoSession();
-    if (saved && Object.keys(saved.cookies).length > 0) {
+    const hasCoreAuthCookie = Boolean(saved && (saved.cookies.cookie2 || saved.cookies.uc3 || saved.cookies.sgcookie));
+    if (saved && hasCoreAuthCookie && Object.keys(saved.cookies).length > 0) {
       return {
         state: 'logged_in',
         nickname: saved.nick,
@@ -1899,7 +1901,9 @@ export class SessionsController implements OnModuleInit {
       nickname: '未登录',
       pin: '—',
       cookieCount: 0,
-      message: '尚未保存淘宝 / 天猫登录态，请使用下方「淘宝 App 扫码登录」或「手机号短信验证码登录」',
+      message: saved
+        ? '淘宝核心登录凭证 (cookie2/uc3) 缺失或已过期，请使用下方「淘宝 App 扫码登录」重新扫码同步'
+        : '尚未保存淘宝 / 天猫登录态，请使用下方「淘宝 App 扫码登录」或「手机号短信验证码登录」',
     };
   }
 
