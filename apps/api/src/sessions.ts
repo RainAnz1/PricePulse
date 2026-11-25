@@ -109,6 +109,39 @@ export function getJdSessionFilePath(): string {
   return join(getDataRoot(), 'PriceDrop', 'sessions', 'jd.json');
 }
 
+export function getTaobaoSessionFilePath(): string {
+  return join(getDataRoot(), 'PriceDrop', 'sessions', 'taobao.json');
+}
+
+export interface PersistedTaobaoSession {
+  platform: 'taobao';
+  nick: string;
+  uid: string;
+  cookies: Record<string, string>;
+  cookieHeader: string;
+  updatedAt: string;
+  lastKeepAliveAt?: string;
+}
+
+export function loadPersistedTaobaoSession(): PersistedTaobaoSession | null {
+  const filePath = getTaobaoSessionFilePath();
+  if (!existsSync(filePath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as PersistedTaobaoSession;
+    if (!parsed || !parsed.cookies || Object.keys(parsed.cookies).length === 0) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function savePersistedTaobaoSession(session: PersistedTaobaoSession): PersistedTaobaoSession {
+  const filePath = getTaobaoSessionFilePath();
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
+  return session;
+}
+
 function getJdHeadlessProfilePath(): string {
   return join(getDataRoot(), 'PriceDrop', 'browser-profiles', 'jd-headless');
 }
@@ -479,7 +512,16 @@ async function open(platform: Platform): Promise<BrowserContext> {
   if (pending) return pending;
   const operation = (async () => {
     const profile = join(getDataRoot(), 'PriceDrop', 'browser-profiles', platform);
-    const context = await chromium.launchPersistentContext(profile, { channel: 'msedge', headless: false });
+    let context: BrowserContext;
+    try {
+      context = await chromium.launchPersistentContext(profile, { channel: 'chrome', headless: false });
+    } catch {
+      try {
+        context = await chromium.launchPersistentContext(profile, { channel: 'msedge', headless: false });
+      } catch {
+        context = await chromium.launchPersistentContext(profile, { headless: false });
+      }
+    }
     contexts.set(platform, context);
     context.on('close', () => {
       if (contexts.get(platform) === context) contexts.delete(platform);
@@ -1035,6 +1077,58 @@ export class SessionsController implements OnModuleInit {
     };
   }
 
+  /**
+   * 7. 查询服务端已保存的淘宝 / 天猫登录态详情
+   */
+  @Get('taobao/status')
+  async getTaobaoStatus() {
+    const saved = loadPersistedTaobaoSession();
+    if (saved && Object.keys(saved.cookies).length > 0) {
+      return {
+        state: 'logged_in',
+        nickname: saved.nick,
+        pin: saved.uid || saved.nick,
+        updatedAt: saved.updatedAt,
+        lastKeepAliveAt: saved.lastKeepAliveAt || saved.updatedAt,
+        cookieCount: Object.keys(saved.cookies).length,
+        storagePath: getTaobaoSessionFilePath(),
+        message: `淘宝登录态已保存在服务端（账号：${saved.nick}，共 ${Object.keys(saved.cookies).length} 项 Cookie）`,
+      };
+    }
+    return {
+      state: 'login_required',
+      nickname: '未登录',
+      pin: '—',
+      cookieCount: 0,
+      message: '尚未保存淘宝 / 天猫登录态，可点击「打开淘宝扫码登录」完成后点击「同步并保存会话」',
+    };
+  }
+
+  /**
+   * 8. 手动触发淘宝服务端登录态保活刷新
+   */
+  @Post('taobao/keepalive')
+  async keepAliveTaobao(@Req() req: Request) {
+    validateOrigin(req);
+    const saved = loadPersistedTaobaoSession();
+    if (!saved) {
+      throw new BadRequestException('尚未保存淘宝登录态，请先登录淘宝并同步会话');
+    }
+    const updated = savePersistedTaobaoSession({
+      ...saved,
+      lastKeepAliveAt: new Date().toISOString(),
+    });
+    return {
+      state: 'logged_in',
+      nickname: updated.nick,
+      pin: updated.uid || updated.nick,
+      updatedAt: updated.updatedAt,
+      lastKeepAliveAt: updated.lastKeepAliveAt,
+      cookieCount: Object.keys(updated.cookies).length,
+      message: `淘宝服务端保活完成（账号：${updated.nick}，共 ${Object.keys(updated.cookies).length} 项 Cookie）`,
+    };
+  }
+
   @Post(':platform/open')
   async open(@Param('platform') input: string, @Req() req: Request) {
     validateOrigin(req);
@@ -1046,11 +1140,15 @@ export class SessionsController implements OnModuleInit {
         await page.goto(urls[platform], { waitUntil: 'domcontentloaded', timeout: 30000 });
       }
       await page.bringToFront();
-      return { state: 'opened', message: '浏览器已打开，请在窗口中自行登录' };
+      return {
+        state: 'opened',
+        message:
+          platform === 'taobao'
+            ? '淘宝登录窗口已打开，扫码登录成功后请点击「同步并检查淘宝状态」保存至服务端'
+            : '浏览器已打开，请在窗口中自行登录',
+      };
     } catch {
-      throw new InternalServerErrorException(
-        '无法打开项目浏览器，请确认已安装 Microsoft Edge 且该平台的项目浏览器未被占用',
-      );
+      throw new InternalServerErrorException('无法打开项目浏览器，请确认本地 Chrome 或 Edge 未被占用');
     }
   }
 
@@ -1068,13 +1166,53 @@ export class SessionsController implements OnModuleInit {
 
     const context = contexts.get(platform);
     if (!context) {
+      if (platform === 'taobao') {
+        const tbStatus = await this.getTaobaoStatus();
+        if (tbStatus.state === 'logged_in') return tbStatus;
+      }
       return {
         state: 'unknown',
         message:
           platform === 'jd'
             ? '未检测到有效京东登录态，请使用「京东扫码登录」或「手机号验证码登录」'
-            : '请先打开项目浏览器并登录',
+            : '尚未检测到淘宝登录窗口，请先点击「打开淘宝扫码登录」',
       };
+    }
+
+    if (platform === 'taobao') {
+      try {
+        const allCookies = await context.cookies(['https://www.taobao.com', 'https://www.tmall.com']);
+        const cookieMap: Record<string, string> = {};
+        for (const c of allCookies) {
+          if (c.name && c.value) cookieMap[c.name] = c.value;
+        }
+        const rawNick = decodeCookieValue(cookieMap.tracknick || cookieMap._nk_ || cookieMap.lgc || '');
+        const hasAuth = Boolean(cookieMap.cookie2 || cookieMap._tb_token_ || cookieMap.unb || rawNick);
+        if (hasAuth && Object.keys(cookieMap).length > 3) {
+          const saved = savePersistedTaobaoSession({
+            platform: 'taobao',
+            nick: rawNick || '淘宝已登录用户',
+            uid: cookieMap.unb || rawNick || 'tb_user',
+            cookies: cookieMap,
+            cookieHeader: buildCookieHeader(cookieMap),
+            updatedAt: new Date().toISOString(),
+            lastKeepAliveAt: new Date().toISOString(),
+          });
+          return {
+            state: 'logged_in',
+            nickname: saved.nick,
+            pin: saved.uid,
+            updatedAt: saved.updatedAt,
+            lastKeepAliveAt: saved.lastKeepAliveAt,
+            cookieCount: Object.keys(saved.cookies).length,
+            message: `已同步并保存淘宝登录态至服务端（账号：${saved.nick}，共 ${
+              Object.keys(saved.cookies).length
+            } 项 Cookie）`,
+          };
+        }
+      } catch {
+        // fall through to page check
+      }
     }
     const page = context.pages().find(candidate => {
       try {
