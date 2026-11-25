@@ -36,7 +36,25 @@ export interface PriceDropAlertPayload {
 }
 
 function getDataRoot(): string {
-  return process.env.LOCALAPPDATA || join(process.cwd(), '.local-data');
+  if (process.env.LOCALAPPDATA) return process.env.LOCALAPPDATA;
+  let dir = process.cwd();
+  for (let i = 0; i < 4; i++) {
+    const pkgPath = join(dir, 'package.json');
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { workspaces?: unknown };
+        if (pkg.workspaces) {
+          return join(dir, '.local-data');
+        }
+      } catch {
+        // ignore
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return join(process.cwd(), '.local-data');
 }
 
 function getFeishuConfigPath(): string {
@@ -46,8 +64,13 @@ function getFeishuConfigPath(): string {
 function validateOrigin(req: Request) {
   const origin = req.get('origin');
   if (!origin) return;
-  if (origin !== 'http://127.0.0.1:8090' && origin !== 'http://localhost:8090') {
-    throw new ForbiddenException('请从本地网站操作');
+  try {
+    const parsed = new URL(origin);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new ForbiddenException('非法的请求来源协议');
+    }
+  } catch {
+    throw new ForbiddenException('非法的请求来源');
   }
 }
 

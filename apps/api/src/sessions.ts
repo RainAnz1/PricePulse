@@ -233,8 +233,13 @@ function platformOf(value: string): Platform {
 function validateOrigin(req: Request) {
   const origin = req.get('origin');
   if (!origin) return;
-  if (origin !== 'http://127.0.0.1:8090' && origin !== 'http://localhost:8090') {
-    throw new ForbiddenException('请从本地网站操作');
+  try {
+    const parsed = new URL(origin);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new ForbiddenException('非法的请求来源协议');
+    }
+  } catch {
+    throw new ForbiddenException('非法的请求来源');
   }
 }
 
@@ -383,57 +388,128 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
   return { authenticated: false, pin: '', nickname: '', refreshedCookies };
 }
 
+async function launchStealthPersistentContext(profileDir: string): Promise<BrowserContext> {
+  mkdirSync(profileDir, { recursive: true });
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-blink-features=AutomationControlled',
+  ];
+  const baseOptions = {
+    headless: true,
+    userAgent: JD_UA,
+    viewport: { width: 1366, height: 860 },
+    args: launchArgs,
+    extraHTTPHeaders: {
+      'sec-ch-ua': '"Google Chrome";v="130", "Chromium";v="130", "Not?A_Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"macOS"',
+    },
+  };
+
+  let context: BrowserContext | null = null;
+  const candidateBins = [
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+  ].filter((p): p is string => Boolean(p && existsSync(p)));
+
+  for (const executablePath of candidateBins) {
+    try {
+      context = await chromium.launchPersistentContext(profileDir, {
+        ...baseOptions,
+        executablePath,
+      });
+      break;
+    } catch {
+      // try next executable
+    }
+  }
+
+  if (!context) {
+    try {
+      context = await chromium.launchPersistentContext(profileDir, {
+        ...baseOptions,
+        channel: 'chrome',
+      });
+    } catch {
+      context = await chromium.launchPersistentContext(profileDir, baseOptions);
+    }
+  }
+
+  await context
+    .addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    })
+    .catch(() => {});
+
+  return context;
+}
+
+export async function ensureJdContextCookies(context: BrowserContext): Promise<void> {
+  const existing = loadPersistedJdSession();
+  if (!existing) return;
+  try {
+    const entries = Object.entries(existing.cookies).filter(([k, v]) => Boolean(k && v));
+    const toAdd = entries.flatMap(([name, value]) => [
+      { name, value: String(value), domain: '.jd.com', path: '/' },
+      { name, value: String(value), domain: 'item.jd.com', path: '/' },
+      { name, value: String(value), domain: 'passport.jd.com', path: '/' },
+    ]);
+    if (toAdd.length > 0) {
+      await context.addCookies(toAdd);
+    }
+  } catch {
+    // ignore cookie injection warnings
+  }
+}
+
+export async function ensureTaobaoContextCookies(context: BrowserContext): Promise<void> {
+  const existing = loadPersistedTaobaoSession();
+  if (!existing) return;
+  try {
+    const entries = Object.entries(existing.cookies).filter(([k, v]) => Boolean(k && v));
+    const toAdd = entries.flatMap(([name, value]) => [
+      { name, value: String(value), domain: '.taobao.com', path: '/' },
+      { name, value: String(value), domain: '.tmall.com', path: '/' },
+    ]);
+    if (existing.cookieList && existing.cookieList.length > 0) {
+      for (const c of existing.cookieList) {
+        if (c.name && c.value) {
+          toAdd.push({
+            name: c.name,
+            value: String(c.value),
+            domain: c.domain || '.taobao.com',
+            path: c.path || '/',
+          });
+        }
+      }
+    }
+    if (toAdd.length > 0) {
+      await context.addCookies(toAdd);
+    }
+  } catch {
+    // ignore cookie injection warnings
+  }
+}
+
 /**
  * 获取服务端常驻无头浏览器上下文（持久化 Profile + 自动注入已保存的 Cookie）
  * 用于执行京东 h5st 签名、Ticket 校验、短信验证码发送与登录，以及带登录态的商品价格采集
  */
 export async function getJdHeadlessContext(): Promise<BrowserContext> {
-  if (headlessAuthContext) return headlessAuthContext;
+  if (headlessAuthContext) {
+    await ensureJdContextCookies(headlessAuthContext);
+    return headlessAuthContext;
+  }
   if (headlessAuthLaunching) return headlessAuthLaunching;
 
   const task = (async () => {
     const profileDir = getJdHeadlessProfilePath();
-    mkdirSync(profileDir, { recursive: true });
-    let context: BrowserContext;
-    try {
-      context = await chromium.launchPersistentContext(profileDir, {
-        channel: 'chrome',
-        headless: true,
-        userAgent: JD_UA,
-        viewport: { width: 1280, height: 800 },
-      });
-    } catch {
-      context = await chromium.launchPersistentContext(profileDir, {
-        headless: true,
-        userAgent: JD_UA,
-        viewport: { width: 1280, height: 800 },
-      });
-    }
-
-    const existing = loadPersistedJdSession();
-    if (existing) {
-      try {
-        const toAdd =
-          existing.cookieList && existing.cookieList.length > 0
-            ? existing.cookieList.map(c => ({
-                name: c.name,
-                value: c.value,
-                domain: c.domain || '.jd.com',
-                path: c.path || '/',
-              }))
-            : Object.entries(existing.cookies).map(([name, value]) => ({
-                name,
-                value: String(value),
-                domain: '.jd.com',
-                path: '/',
-              }));
-        if (toAdd.length > 0) {
-          await context.addCookies(toAdd);
-        }
-      } catch {
-        // ignore cookie injection warnings
-      }
-    }
+    const context = await launchStealthPersistentContext(profileDir);
+    await ensureJdContextCookies(context);
 
     headlessAuthContext = context;
     context.on('close', () => {
@@ -478,7 +554,13 @@ async function syncCookiesFromHeadlessContext(
   extraMeta?: { mobile?: string; lastCheckCode?: number; lastValidateReturnCode?: number },
 ): Promise<PersistedJdSession> {
   const context = await getJdHeadlessContext();
-  const browserCookies = await context.cookies(['https://www.jd.com', 'https://passport.jd.com', 'https://item.jd.com', 'https://m.jd.com']);
+  const browserCookies = await context.cookies([
+    'https://www.jd.com',
+    'https://passport.jd.com',
+    'https://item.jd.com',
+    'https://m.jd.com',
+    'https://item.m.jd.com',
+  ]);
   const cookieMap: Record<string, string> = { ...extraCookies };
   const cookieList: StoredCookieItem[] = [];
 
@@ -585,55 +667,19 @@ export async function runJdSessionKeepAlive(): Promise<{
 }
 
 /**
- * 获取淘宝服务端常驻无头浏览器上下文（用于执行淘宝二维码生成、扫码状态轮询、短信验证码登录与 Cookie 持久化）
+ * 获取淘宝服务端常驻无头浏览器上下文（用于执行淘宝二维码生成、扫码状态轮询、短信验证码登录与商品详情采集）
  */
 export async function getTaobaoHeadlessContext(): Promise<BrowserContext> {
-  if (headlessTbContext) return headlessTbContext;
+  if (headlessTbContext) {
+    await ensureTaobaoContextCookies(headlessTbContext);
+    return headlessTbContext;
+  }
   if (headlessTbLaunching) return headlessTbLaunching;
 
   const task = (async () => {
     const profileDir = getTaobaoHeadlessProfilePath();
-    mkdirSync(profileDir, { recursive: true });
-    let context: BrowserContext;
-    try {
-      context = await chromium.launchPersistentContext(profileDir, {
-        channel: 'chrome',
-        headless: true,
-        userAgent: JD_UA,
-        viewport: { width: 1280, height: 800 },
-      });
-    } catch {
-      context = await chromium.launchPersistentContext(profileDir, {
-        headless: true,
-        userAgent: JD_UA,
-        viewport: { width: 1280, height: 800 },
-      });
-    }
-
-    const existing = loadPersistedTaobaoSession();
-    if (existing) {
-      try {
-        const toAdd =
-          existing.cookieList && existing.cookieList.length > 0
-            ? existing.cookieList.map(c => ({
-                name: c.name,
-                value: c.value,
-                domain: c.domain || '.taobao.com',
-                path: c.path || '/',
-              }))
-            : Object.entries(existing.cookies).map(([name, value]) => ({
-                name,
-                value: String(value),
-                domain: '.taobao.com',
-                path: '/',
-              }));
-        if (toAdd.length > 0) {
-          await context.addCookies(toAdd);
-        }
-      } catch {
-        // ignore cookie injection warning
-      }
-    }
+    const context = await launchStealthPersistentContext(profileDir);
+    await ensureTaobaoContextCookies(context);
 
     headlessTbContext = context;
     context.on('close', () => {
@@ -662,8 +708,12 @@ async function syncTaobaoCookiesFromHeadlessContext(
   const browserCookies = await context.cookies([
     'https://www.taobao.com',
     'https://www.tmall.com',
+    'https://detail.tmall.com',
+    'https://item.taobao.com',
     'https://login.taobao.com',
     'https://i.taobao.com',
+    'https://h5api.m.taobao.com',
+    'https://h5api.m.tmall.com',
   ]);
   const cookieMap: Record<string, string> = { ...extraCookies };
   const cookieList: StoredCookieItem[] = [];
@@ -940,18 +990,17 @@ export class SessionsController implements OnModuleInit {
         const qrCookiesSnapshot = { ...activeJdQrSession.cookies };
         let valJson: { returnCode?: number; url?: string } = {};
 
-        // 优先在服务端无头浏览器页面中执行带真实 h5st / _stk 签名的 qrCodeTicketValidation
+        // 1. 先在无头浏览器加载完登录页后再注入当前二维码的 wlfstk_smdl / QRCodeKey，防止页面初始化请求覆盖二维码 Cookie
         try {
           const context = await getJdHeadlessContext();
-          await context.addCookies(
-            Object.entries(qrCookiesSnapshot).map(([name, value]) => ({
-              name,
-              value,
-              domain: '.jd.com',
-              path: '/',
-            })),
-          );
           const page = await getOrOpenHeadlessJdLoginPage();
+          const cookieItems = Object.entries(qrCookiesSnapshot).flatMap(([name, value]) => [
+            { name, value, domain: '.jd.com', path: '/' },
+            { name, value, domain: 'qr.m.jd.com', path: '/' },
+            { name, value, domain: 'passport.jd.com', path: '/' },
+          ]);
+          await context.addCookies(cookieItems);
+
           valJson = await page.evaluate(async (tk: string) => {
             const w = window as unknown as {
               paramsSingUtils?: (p: { t: string }) => Promise<{ h5st?: string; _stk?: string }>;
@@ -991,27 +1040,47 @@ export class SessionsController implements OnModuleInit {
             await page.goto(valJson.url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
           }
         } catch {
-          // 降级为服务端直连校验
-          const validateUrl = `${JD_QR_VALIDATE_URL}?t=${encodeURIComponent(
-            ticket,
-          )}&pageSource=commonLogin&pageLocation=&ReturnUrl=${encodeURIComponent('https://www.jd.com/')}`;
-          const valRes = await fetch(validateUrl, {
-            headers: {
-              'User-Agent': JD_UA,
-              Referer: JD_LOGIN_PAGE_URL,
-              Cookie: buildCookieHeader(qrCookiesSnapshot),
-              'X-Requested-With': 'XMLHttpRequest',
-            },
-          });
-          const valSetCookies =
-            typeof valRes.headers.getSetCookie === 'function'
-              ? valRes.headers.getSetCookie()
-              : [valRes.headers.get('set-cookie') || ''].filter(Boolean);
-          Object.assign(qrCookiesSnapshot, parseSetCookieHeaders(valSetCookies));
+          // ignore headless ticket validation error, will run direct validation below
+        }
+
+        // 2. 若无头页面未成功拿到 returnCode === 0，执行服务端直连 Ticket 校验兜底并将 Set-Cookie (含 thor) 同步回无头上下文
+        if (valJson.returnCode !== 0) {
           try {
-            valJson = (await valRes.json()) as { returnCode?: number; url?: string };
+            const validateUrl = `${JD_QR_VALIDATE_URL}?t=${encodeURIComponent(
+              ticket,
+            )}&pageSource=commonLogin&pageLocation=&ReturnUrl=${encodeURIComponent('https://www.jd.com/')}`;
+            const valRes = await fetch(validateUrl, {
+              headers: {
+                'User-Agent': JD_UA,
+                Referer: JD_LOGIN_PAGE_URL,
+                Cookie: buildCookieHeader(qrCookiesSnapshot),
+                'X-Requested-With': 'XMLHttpRequest',
+              },
+            });
+            const valSetCookies =
+              typeof valRes.headers.getSetCookie === 'function'
+                ? valRes.headers.getSetCookie()
+                : [valRes.headers.get('set-cookie') || ''].filter(Boolean);
+            const parsedValCookies = parseSetCookieHeaders(valSetCookies);
+            Object.assign(qrCookiesSnapshot, parsedValCookies);
+            try {
+              valJson = (await valRes.json()) as { returnCode?: number; url?: string };
+            } catch {
+              // ignore
+            }
+            const context = await getJdHeadlessContext();
+            await context
+              .addCookies(
+                Object.entries(parsedValCookies).map(([name, value]) => ({
+                  name,
+                  value,
+                  domain: '.jd.com',
+                  path: '/',
+                })),
+              )
+              .catch(() => {});
           } catch {
-            // ignore
+            // ignore fallback network error
           }
         }
 
@@ -1421,23 +1490,9 @@ export class SessionsController implements OnModuleInit {
       return { csrf };
     });
 
-    if (!capturedGen) {
-      // 主动调用一次 generate.do 获取 t, ck, codeContent
-      const directGen = await page
-        .evaluate(async (csrf: string) => {
-          const r = await fetch(
-            `/havanaone/loginLegacy/qrCode/generate.do?bizEntrance=taobao_pc&bizName=taobao&sub=true&hitRSA2048Gray=true&_csrf=${encodeURIComponent(
-              csrf,
-            )}&lang=zh_CN&umidToken=&umidTag=NOT_INIT`,
-            { credentials: 'include' },
-          );
-          const j = (await r.json()) as {
-            content?: { data?: { t?: number; ck?: string; codeContent?: string; resultCode?: number } };
-          };
-          return j?.content?.data || null;
-        }, meta.csrf)
-        .catch(() => null);
-      if (directGen) capturedGen = directGen;
+    // 等待页面自身发出的 generate.do 响应返回（不要二次主动请求 generate.do，以免服务端 ck 与画布上的二维码不一致）
+    for (let waitAttempt = 0; waitAttempt < 12 && !capturedGen; waitAttempt++) {
+      await page.waitForTimeout(200);
     }
 
     const pngBuffer = await canvasLoc.screenshot({ type: 'png' });
@@ -1554,64 +1609,88 @@ export class SessionsController implements OnModuleInit {
                   };
                 };
               };
-              return j?.content?.data || null;
-            },
-            {
-              t: activeTaobaoQrSession.t,
-              ck: activeTaobaoQrSession.ck,
-              csrf: activeTaobaoQrSession.csrf,
-            },
-          )
-          .catch(() => null);
+                if (j?.content?.data?.qrCodeStatus === 'CONFIRMED') {
+                  const w = window as unknown as {
+                    miniLogin?: { handleLoginResult?: (data: unknown) => void };
+                  };
+                  try {
+                    w.miniLogin?.handleLoginResult?.(j.content.data);
+                  } catch {
+                    // ignore
+                  }
+                  const asyncUrls = j.content.data.asyncUrls || [];
+                  for (const url of asyncUrls) {
+                    try {
+                      await fetch(url, { credentials: 'include', mode: 'no-cors' });
+                    } catch {
+                      // ignore
+                    }
+                  }
+                }
+                return j?.content?.data || null;
+              },
+              {
+                t: activeTaobaoQrSession.t,
+                ck: activeTaobaoQrSession.ck,
+                csrf: activeTaobaoQrSession.csrf,
+              },
+            )
+            .catch(() => null);
 
-        if (queryData?.qrCodeStatus) {
-          activeTaobaoQrSession.lastStatus = queryData.qrCodeStatus;
-          activeTaobaoQrSession.lastMessage = queryData.titleMsg || activeTaobaoQrSession.lastMessage;
-          const targetRedirect = queryData.redirectUrl || queryData.iframeRedirectUrl || queryData.asyncUrls?.[0];
-          if (targetRedirect) {
-            activeTaobaoQrSession.redirectUrl = targetRedirect;
+          if (queryData?.qrCodeStatus) {
+            activeTaobaoQrSession.lastStatus = queryData.qrCodeStatus;
+            activeTaobaoQrSession.lastMessage = queryData.titleMsg || activeTaobaoQrSession.lastMessage;
+            const targetRedirect = queryData.redirectUrl || queryData.iframeRedirectUrl || queryData.asyncUrls?.[0];
+            if (targetRedirect) {
+              activeTaobaoQrSession.redirectUrl = targetRedirect;
+            }
           }
         }
       }
-    }
 
-    switch (activeTaobaoQrSession.lastStatus) {
-      case 'NEW':
-        return {
-          state: 'qr_waiting',
-          code: 100,
-          qrCodeStatus: 'NEW',
-          message: activeTaobaoQrSession.lastMessage || '二维码未扫描，请打开手机淘宝 App 扫一扫',
-        };
-      case 'SCANED':
-        return {
-          state: 'qr_scanned',
-          code: 101,
-          qrCodeStatus: 'SCANED',
-          message: '扫描成功！请在手机淘宝 App 上点击「确认登录」',
-        };
-      case 'EXPIRED':
-        return {
-          state: 'qr_expired',
-          code: 103,
-          qrCodeStatus: 'EXPIRED',
-          message: '淘宝二维码已失效，请点击刷新二维码',
-        };
-      case 'CANCELED':
-      case 'ERROR':
-        return {
-          state: 'qr_cancelled',
-          code: 105,
-          qrCodeStatus: activeTaobaoQrSession.lastStatus,
-          message: activeTaobaoQrSession.lastMessage || '已在手机端取消扫码登录，请重新获取二维码',
-        };
-      case 'CONFIRMED': {
-        if (activeTaobaoQrSession.redirectUrl && headlessTbPage && !headlessTbPage.isClosed()) {
-          await headlessTbPage
-            .goto(activeTaobaoQrSession.redirectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 })
-            .catch(() => {});
-        }
-        const saved = await syncTaobaoCookiesFromHeadlessContext({}, 'qrcode');
+      switch (activeTaobaoQrSession.lastStatus) {
+        case 'NEW':
+          return {
+            state: 'qr_waiting',
+            code: 100,
+            qrCodeStatus: 'NEW',
+            message: activeTaobaoQrSession.lastMessage || '二维码未扫描，请打开手机淘宝 App 扫一扫',
+          };
+        case 'SCANED':
+          return {
+            state: 'qr_scanned',
+            code: 101,
+            qrCodeStatus: 'SCANED',
+            message: '扫描成功！请在手机淘宝 App 上点击「确认登录」',
+          };
+        case 'EXPIRED':
+          return {
+            state: 'qr_expired',
+            code: 103,
+            qrCodeStatus: 'EXPIRED',
+            message: '淘宝二维码已失效，请点击刷新二维码',
+          };
+        case 'CANCELED':
+        case 'ERROR':
+          return {
+            state: 'qr_cancelled',
+            code: 105,
+            qrCodeStatus: activeTaobaoQrSession.lastStatus,
+            message: activeTaobaoQrSession.lastMessage || '已在手机端取消扫码登录，请重新获取二维码',
+          };
+        case 'CONFIRMED': {
+          if (headlessTbPage && !headlessTbPage.isClosed()) {
+            await headlessTbPage.waitForTimeout(1000).catch(() => {});
+            if (activeTaobaoQrSession.redirectUrl) {
+              await headlessTbPage
+                .goto(activeTaobaoQrSession.redirectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 })
+                .catch(() => {});
+            }
+            await headlessTbPage
+              .goto('https://www.taobao.com/', { waitUntil: 'domcontentloaded', timeout: 12000 })
+              .catch(() => {});
+          }
+          const saved = await syncTaobaoCookiesFromHeadlessContext({}, 'qrcode');
         activeTaobaoQrSession = null;
         return {
           state: 'logged_in',

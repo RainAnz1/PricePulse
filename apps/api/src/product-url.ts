@@ -5,40 +5,106 @@ export interface ProductIdentity {
   id: string;
   skuId: string | null;
   canonicalUrl: string;
+  isTmall?: boolean;
+  hintTitle?: string;
 }
 
-export function parseProductUrl(input?: string): ProductIdentity {
-  if (!input || input.length > 2048) throw new BadRequestException('请输入有效的商品链接');
+function cleanExtractedTitle(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  const cleaned = raw
+    .replace(/-tmall\.com天猫.*$/i, '')
+    .replace(/-淘宝网.*$/i, '')
+    .replace(/【图片\s*价格\s*品牌\s*评论】-京东.*$/i, '')
+    .trim();
+  return cleaned.length >= 2 ? cleaned : undefined;
+}
+
+export function parseProductUrl(input?: string, hintTitle?: string): ProductIdentity {
+  if (!input || input.length > 4096) throw new BadRequestException('请输入有效的商品链接');
   let url: URL;
-  try { url = new URL(input.trim()); } catch { throw new BadRequestException('请输入完整的商品链接'); }
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.port) throw new BadRequestException('请输入标准商品链接');
+  try {
+    url = new URL(input.trim());
+  } catch {
+    throw new BadRequestException('请输入完整的商品链接');
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.port) {
+    throw new BadRequestException('请输入标准商品链接');
+  }
   const host = url.hostname.toLowerCase();
   const jd = host === 'item.jd.com';
-  const taobao = host === 'item.taobao.com' || host === 'detail.tmall.com' || host === 'detail.m.tmall.com' || host === 'item.m.jd.com' || host === 'h5.m.taobao.com';
-  const mobileJd = host === 'item.m.jd.com';
-  if (!jd && !taobao) throw new BadRequestException('请使用京东、淘宝或天猫的标准商品详情链接');
-  if (jd || mobileJd) {
-    const id = jd ? url.pathname.match(/^\/(\d+)\.html$/)?.[1] : url.searchParams.get('sku');
-    if (!id || !/^[1-9]\d*$/.test(id)) throw new BadRequestException('无法识别商品 ID');
-    return { platform: 'jd', id, skuId: id, canonicalUrl: `https://item.jd.com/${id}.html` };
+  const mobileJd = host === 'item.m.jd.com' || host === 'wqitem.jd.com';
+  const isTmall = host.endsWith('tmall.com') || host.endsWith('tmall.hk');
+  const taobao =
+    host === 'item.taobao.com' ||
+    host === 'detail.tmall.com' ||
+    host === 'chaoshi.detail.tmall.com' ||
+    host === 'detail.tmall.hk' ||
+    host === 'detail.m.tmall.com' ||
+    host === 'h5.m.taobao.com' ||
+    host === 'main.m.taobao.com' ||
+    host === 'a.m.taobao.com' ||
+    host === 'world.taobao.com';
+
+  if (!jd && !mobileJd && !taobao) {
+    throw new BadRequestException('请使用京东、淘宝或天猫的标准商品详情链接');
   }
-  const id = url.searchParams.get('id');
-  const skuId = url.searchParams.get('skuId');
-  if (!id || !/^[1-9]\d*$/.test(id) || (skuId !== null && !/^[1-9]\d*$/.test(skuId))) throw new BadRequestException('无法识别商品 ID 或规格 ID');
-  const canonical = new URL(`https://${host.endsWith('tmall.com') ? 'detail.tmall.com' : 'item.taobao.com'}/item.htm?id=${id}`);
+
+  if (jd || mobileJd) {
+    const id =
+      url.pathname.match(/\/(\d+)\.html$/i)?.[1] ||
+      url.searchParams.get('sku') ||
+      url.searchParams.get('wareId') ||
+      url.searchParams.get('id');
+    if (!id || !/^[1-9]\d*$/.test(id)) throw new BadRequestException('无法识别京东商品 SKU ID');
+    return {
+      platform: 'jd',
+      id,
+      skuId: id,
+      canonicalUrl: `https://item.jd.com/${id}.html`,
+      hintTitle: cleanExtractedTitle(hintTitle),
+    };
+  }
+
+  const id =
+    url.searchParams.get('id') ||
+    url.searchParams.get('itemId') ||
+    url.pathname.match(/\/i(\d+)\.htm/i)?.[1] ||
+    url.pathname.match(/\/item\/(\d+)\.htm/i)?.[1];
+  const rawSkuId = url.searchParams.get('skuId') || url.searchParams.get('sku_id');
+  const skuId = rawSkuId && /^[1-9]\d*$/.test(rawSkuId) ? rawSkuId : null;
+
+  if (!id || !/^[1-9]\d*$/.test(id)) {
+    throw new BadRequestException('无法识别淘宝或天猫商品 ID');
+  }
+
+  const canonical = new URL(`https://${isTmall ? 'detail.tmall.com' : 'item.taobao.com'}/item.htm?id=${id}`);
   if (skuId) canonical.searchParams.set('skuId', skuId);
-  return { platform: 'taobao', id, skuId, canonicalUrl: canonical.toString() };
+
+  return {
+    platform: 'taobao',
+    id,
+    skuId,
+    canonicalUrl: canonical.toString(),
+    isTmall,
+    hintTitle: cleanExtractedTitle(hintTitle),
+  };
 }
 
 export async function resolveAndParseProductUrl(rawInput?: string): Promise<ProductIdentity> {
   if (!rawInput || !rawInput.trim()) {
     throw new BadRequestException('请输入有效的商品链接');
   }
-  const urlMatch = rawInput.trim().match(/https?:\/\/[^\s"'<>]+/i);
-  const candidate = urlMatch ? urlMatch[0] : rawInput.trim();
+
+  const trimmed = rawInput.trim();
+  const mdMatch = trimmed.match(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/i);
+  const bracketTitleMatch = trimmed.match(/「([^」]{2,120})」/);
+  const hintTitle = cleanExtractedTitle(mdMatch?.[1] || bracketTitleMatch?.[1]);
+
+  const rawUrlMatch = mdMatch?.[2] || trimmed.match(/https?:\/\/[^\s"'<>)\]]+/i)?.[0];
+  const candidate = (rawUrlMatch || trimmed).replace(/[)\]'"]+$/, '');
 
   try {
-    return parseProductUrl(candidate);
+    return parseProductUrl(candidate, hintTitle);
   } catch (directError) {
     let parsedUrl: URL;
     try {
@@ -51,10 +117,13 @@ export async function resolveAndParseProductUrl(rawInput?: string): Promise<Prod
       host === '3.cn' ||
       host === 'u.jd.com' ||
       host === 'm.tb.cn' ||
+      host === 'e.tb.cn' ||
       host === 'tb.cn' ||
+      host === 's.click.taobao.com' ||
       host.endsWith('.jd.com') ||
       host.endsWith('.taobao.com') ||
-      host.endsWith('.tmall.com');
+      host.endsWith('.tmall.com') ||
+      host.endsWith('.tmall.hk');
     if (!isShortHost) throw directError;
 
     try {
@@ -67,13 +136,26 @@ export async function resolveAndParseProductUrl(rawInput?: string): Promise<Prod
         },
       });
       if (res.url && res.url !== candidate) {
-        return parseProductUrl(res.url);
+        try {
+          return parseProductUrl(res.url, hintTitle);
+        } catch {
+          // continue inspecting HTML body for secondary redirect URL
+        }
       }
       const html = await res.text();
-      const hrlMatch = html.match(/hrl\s*=\s*['"](https?:\/\/[^'"]+)['"]/i) || html.match(/https?:\/\/item\.(?:m\.)?jd\.com\/(?:product\/)?\d+\.html/i);
+      const htmlTitle = cleanExtractedTitle(html.match(/<title>([^<]+)<\/title>/i)?.[1]);
+      const effectiveHint = hintTitle || (htmlTitle && !/登录|验证|跳转/.test(htmlTitle) ? htmlTitle : undefined);
+
+      const hrlMatch =
+        html.match(/hrl\s*=\s*['"](https?:\/\/[^'"]+)['"]/i) ||
+        html.match(/var\s+url\s*=\s*['"](https?:\/\/[^'"]+)['"]/i) ||
+        html.match(/location\.href\s*=\s*['"](https?:\/\/[^'"]+)['"]/i) ||
+        html.match(/https?:\/\/item\.(?:m\.)?jd\.com\/(?:product\/)?\d+\.html/i) ||
+        html.match(/https?:\/\/(?:detail\.tmall\.com|item\.taobao\.com)\/item\.htm\?[^"'\s<>]+/i) ||
+        html.match(/https?:\/\/a\.m\.taobao\.com\/i\d+\.htm[^"'\s<>]*/i);
       if (hrlMatch) {
-        const target = hrlMatch[1] || hrlMatch[0];
-        return parseProductUrl(target);
+        const target = (hrlMatch[1] || hrlMatch[0]).replace(/&amp;/g, '&');
+        return parseProductUrl(target, effectiveHint);
       }
     } catch {
       // fall through
@@ -81,3 +163,4 @@ export async function resolveAndParseProductUrl(rawInput?: string): Promise<Prod
     throw directError;
   }
 }
+
