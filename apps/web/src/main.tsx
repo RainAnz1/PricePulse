@@ -4,6 +4,7 @@ import './style.css';
 
 type NavPage = 'home' | 'sessions' | 'feishu';
 type TimeRangePreset = '3d' | '7d' | '15d' | '30d' | 'custom';
+type WatchlistFilter = 'all' | 'dropped' | 'unchanged' | 'low';
 
 interface PriceHistoryPoint {
   timestamp: string;
@@ -689,6 +690,8 @@ function App() {
   const [products, setProducts] = useState<MonitoredProduct[]>([]);
   const [selectedKey, setSelectedKey] = useState<string>('');
   const [productActionBusy, setProductActionBusy] = useState<string>('');
+  const [watchSearch, setWatchSearch] = useState<string>('');
+  const [watchFilter, setWatchFilter] = useState<WatchlistFilter>('all');
 
   // 第一排：京东登录态
   const [jdMessage, setJdMessage] = useState('京东登录态持久保存在服务端，刷新网页或重启服务不会丢失。');
@@ -701,10 +704,16 @@ function App() {
   const [smsCodeInput, setSmsCodeInput] = useState('');
   const [smsCountdown, setSmsCountdown] = useState(0);
 
-  // 第二排：淘宝登录态
-  const [tbMessage, setTbMessage] = useState('支持打开淘宝扫码登录并将登录态 Cookie 同步保存至服务端。');
+  // 第二排：淘宝登录态（与京东完全一致的网页内扫码 + 手机号短信验证码双登录）
+  const [tbMessage, setTbMessage] = useState('淘宝登录态持久保存在服务端，刷新网页或重启服务不会丢失。');
   const [tbBusy, setTbBusy] = useState(false);
   const [tbSession, setTbSession] = useState<PlatformSessionInfo | null>(null);
+  const [tbQr, setTbQr] = useState<JdQrCodeState | null>(null);
+  const [tbAuthTab, setTbAuthTab] = useState<'qrcode' | 'sms'>('qrcode');
+  const [showTbAuthPanel, setShowTbAuthPanel] = useState(false);
+  const [tbMobileInput, setTbMobileInput] = useState('');
+  const [tbSmsCodeInput, setTbSmsCodeInput] = useState('');
+  const [tbSmsCountdown, setTbSmsCountdown] = useState(0);
 
   // 飞书推送配置
   const [feishuConfig, setFeishuConfig] = useState<FeishuConfigState>({
@@ -718,9 +727,55 @@ function App() {
   const [feishuMessage, setFeishuMessage] = useState('');
   const [feishuBusy, setFeishuBusy] = useState(false);
 
+  function isProductDropped(item: MonitoredProduct): boolean {
+    const historyFirst = item.priceHistory?.[0]?.finalPrice ?? item.initialPrice;
+    return (
+      item.lastDropAmount > 0 ||
+      item.finalPrice < item.initialPrice ||
+      item.finalPrice < historyFirst ||
+      item.finalPrice < item.pagePrice
+    );
+  }
+
+  const filteredWatchlist = useMemo(() => {
+    const q = watchSearch.trim().toLowerCase();
+    return products.filter(item => {
+      if (q) {
+        const haystack = [
+          item.title,
+          item.shopName,
+          item.brandName,
+          item.spec,
+          item.id,
+          item.platformLabel || item.platform,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      const dropped = isProductDropped(item);
+      if (watchFilter === 'dropped') return dropped;
+      if (watchFilter === 'unchanged') return !dropped;
+      if (watchFilter === 'low') return item.finalPrice <= item.allTimeLow;
+      return true;
+    });
+  }, [products, watchSearch, watchFilter]);
+
+  const watchCounts = useMemo(() => {
+    const dropped = products.filter(p => isProductDropped(p)).length;
+    const unchanged = products.length - dropped;
+    const low = products.filter(p => p.finalPrice <= p.allTimeLow).length;
+    return { all: products.length, dropped, unchanged, low };
+  }, [products]);
+
   const selectedProduct = useMemo(
-    () => products.find(p => p.key === selectedKey) || products[0] || null,
-    [products, selectedKey],
+    () =>
+      products.find(p => p.key === selectedKey) ||
+      filteredWatchlist[0] ||
+      products[0] ||
+      null,
+    [products, filteredWatchlist, selectedKey],
   );
 
   useEffect(() => {
@@ -766,7 +821,14 @@ function App() {
       .then((data: PlatformSessionInfo | null) => {
         if (data) {
           setTbSession(data);
-          if (data.message) setTbMessage(data.message);
+          if (data.state === 'logged_in') {
+            setTbQr(null);
+            setShowTbAuthPanel(false);
+            setTbMessage(data.message);
+          } else {
+            setShowTbAuthPanel(true);
+            if (data.message) setTbMessage(data.message);
+          }
         }
       })
       .catch(() => {});
@@ -833,6 +895,48 @@ function App() {
     }, 1000);
     return () => window.clearInterval(t);
   }, [smsCountdown]);
+
+  // 淘宝二维码扫码状态实时轮询（登录成功后二维码实时自动关闭并切换为已登录状态）
+  useEffect(() => {
+    if (!tbQr || !['qr_ready', 'qr_waiting', 'qr_scanned'].includes(tbQr.state)) {
+      return;
+    }
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await fetch('/api/sessions/taobao/qrcode/status');
+        if (!res.ok) return;
+        const data = (await res.json()) as JdQrCodeState & PlatformSessionInfo;
+        if (data.state === 'logged_in') {
+          setTbQr(null);
+          setShowTbAuthPanel(false);
+          setTbSession(data);
+          setTbMessage(data.message);
+          return;
+        }
+        setTbQr(prev =>
+          prev
+            ? {
+                ...data,
+                qrImage: prev.qrImage,
+                token: prev.token,
+              }
+            : null,
+        );
+        setTbMessage(`淘宝扫码状态 [${data.code ?? '-'}]：${data.message}`);
+      } catch {
+        // ignore transient error
+      }
+    }, 2200);
+    return () => window.clearInterval(timer);
+  }, [tbQr?.state]);
+
+  useEffect(() => {
+    if (tbSmsCountdown <= 0) return;
+    const t = window.setInterval(() => {
+      setTbSmsCountdown(prev => Math.max(0, prev - 1));
+    }, 1000);
+    return () => window.clearInterval(t);
+  }, [tbSmsCountdown]);
 
   async function parse(event: React.FormEvent) {
     event.preventDefault();
@@ -996,14 +1100,85 @@ function App() {
     }
   }
 
-  async function openTaobaoLogin() {
+  async function logoutJdSession() {
+    setJdBusy(true);
+    try {
+      const response = await fetch('/api/sessions/jd/logout', { method: 'POST' });
+      const data = (await response.json()) as PlatformSessionInfo;
+      setJdSession(data);
+      setJdQr(null);
+      setShowJdAuthPanel(true);
+      setJdMessage(data.message || '已退出京东账号');
+    } catch {
+      setJdMessage('无法连接本地服务');
+    } finally {
+      setJdBusy(false);
+    }
+  }
+
+  async function startTaobaoQrLogin() {
+    setTbBusy(true);
+    setTbAuthTab('qrcode');
+    setShowTbAuthPanel(true);
+    try {
+      const response = await fetch('/api/sessions/taobao/qrcode/start', { method: 'POST' });
+      const data = (await response.json()) as JdQrCodeState;
+      if (!response.ok) throw new Error(data.message || '获取淘宝二维码失败');
+      setTbQr(data);
+      setTbMessage(data.message);
+    } catch (error) {
+      setTbMessage(error instanceof Error ? error.message : '无法连接本地服务');
+    } finally {
+      setTbBusy(false);
+    }
+  }
+
+  async function sendTaobaoSmsCode() {
+    if (!/^1[3-9]\d{9}$/.test(tbMobileInput.trim())) {
+      setTbMessage('请输入有效的 11 位手机号码');
+      return;
+    }
     setTbBusy(true);
     try {
-      const response = await fetch('/api/sessions/taobao/open', { method: 'POST' });
-      const data = (await response.json()) as PlatformSessionInfo;
-      setTbMessage(data.message || '已打开淘宝登录窗口');
-    } catch {
-      setTbMessage('无法连接本地服务');
+      const res = await fetch('/api/sessions/taobao/sms/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mobile: tbMobileInput.trim() }),
+      });
+      const data = (await res.json()) as { message?: string; countdown?: number };
+      if (!res.ok) throw new Error(data.message || '发送验证码失败');
+      setTbSmsCountdown(data.countdown || 60);
+      setTbMessage(data.message || '淘宝短信验证码已发送');
+    } catch (err) {
+      setTbMessage(err instanceof Error ? err.message : '发送验证码失败');
+    } finally {
+      setTbBusy(false);
+    }
+  }
+
+  async function submitTaobaoSmsLogin(event: React.FormEvent) {
+    event.preventDefault();
+    setTbBusy(true);
+    try {
+      const res = await fetch('/api/sessions/taobao/sms/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mobile: tbMobileInput.trim(),
+          code: tbSmsCodeInput.trim(),
+        }),
+      });
+      const data = (await res.json()) as PlatformSessionInfo;
+      if (!res.ok) throw new Error(data.message || '淘宝短信验证码登录失败');
+      if (data.state === 'logged_in') {
+        setTbSession(data);
+        setTbQr(null);
+        setShowTbAuthPanel(false);
+        setTbSmsCodeInput('');
+      }
+      setTbMessage(data.message);
+    } catch (err) {
+      setTbMessage(err instanceof Error ? err.message : '登录失败');
     } finally {
       setTbBusy(false);
     }
@@ -1016,6 +1191,8 @@ function App() {
       const data = (await response.json()) as PlatformSessionInfo;
       if (data.state === 'logged_in') {
         setTbSession(data);
+        setTbQr(null);
+        setShowTbAuthPanel(false);
       }
       setTbMessage(data.message || '检查完成');
     } catch {
@@ -1035,6 +1212,22 @@ function App() {
       setTbMessage(data.message || '淘宝服务端保活完成');
     } catch (err) {
       setTbMessage(err instanceof Error ? err.message : '淘宝保活失败');
+    } finally {
+      setTbBusy(false);
+    }
+  }
+
+  async function logoutTaobaoSession() {
+    setTbBusy(true);
+    try {
+      const response = await fetch('/api/sessions/taobao/logout', { method: 'POST' });
+      const data = (await response.json()) as PlatformSessionInfo;
+      setTbSession(data);
+      setTbQr(null);
+      setShowTbAuthPanel(true);
+      setTbMessage(data.message || '已退出淘宝账号');
+    } catch {
+      setTbMessage('无法连接本地服务');
     } finally {
       setTbBusy(false);
     }
@@ -1206,7 +1399,62 @@ function App() {
               <aside className="apple-surface sidebar-surface">
                 <div className="surface-header">
                   <h2>关注列表</h2>
-                  <span className="surface-count">{products.length} 件商品</span>
+                  <span className="surface-count">
+                    {filteredWatchlist.length} / {products.length} 件商品
+                  </span>
+                </div>
+
+                {/* 关注列表搜索框与降价状态筛选栏 */}
+                <div className="watchlist-toolbar">
+                  <div className="watchlist-search-box">
+                    <input
+                      type="text"
+                      value={watchSearch}
+                      onChange={e => setWatchSearch(e.target.value)}
+                      placeholder="搜索商品名称、店铺、规格或 SKU..."
+                      aria-label="搜索关注商品"
+                    />
+                    {watchSearch && (
+                      <button
+                        type="button"
+                        className="clear-search-btn"
+                        onClick={() => setWatchSearch('')}
+                      >
+                        清空
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="apple-segmented full-width">
+                    <button
+                      type="button"
+                      className={watchFilter === 'all' ? 'active' : ''}
+                      onClick={() => setWatchFilter('all')}
+                    >
+                      全部 ({watchCounts.all})
+                    </button>
+                    <button
+                      type="button"
+                      className={watchFilter === 'dropped' ? 'active' : ''}
+                      onClick={() => setWatchFilter('dropped')}
+                    >
+                      已降价 ({watchCounts.dropped})
+                    </button>
+                    <button
+                      type="button"
+                      className={watchFilter === 'unchanged' ? 'active' : ''}
+                      onClick={() => setWatchFilter('unchanged')}
+                    >
+                      未降价 ({watchCounts.unchanged})
+                    </button>
+                    <button
+                      type="button"
+                      className={watchFilter === 'low' ? 'active' : ''}
+                      onClick={() => setWatchFilter('low')}
+                    >
+                      史低 ({watchCounts.low})
+                    </button>
+                  </div>
                 </div>
 
                 {products.length === 0 ? (
@@ -1214,11 +1462,33 @@ function App() {
                     <p>暂无监控商品</p>
                     <span>在上方粘贴京东或淘宝商品链接即可开始追踪价格走势</span>
                   </div>
+                ) : filteredWatchlist.length === 0 ? (
+                  <div className="apple-empty">
+                    <p>未找到匹配商品</p>
+                    <span>没有符合当前搜索词或筛选条件的关注商品</span>
+                    <div style={{ marginTop: '12px' }}>
+                      <button
+                        type="button"
+                        className="apple-btn-secondary sm"
+                        onClick={() => {
+                          setWatchSearch('');
+                          setWatchFilter('all');
+                        }}
+                      >
+                        重置搜索与筛选
+                      </button>
+                    </div>
+                  </div>
                 ) : (
                   <div className="apple-list">
-                    {products.map(item => {
+                    {filteredWatchlist.map(item => {
                       const isSelected = selectedProduct?.key === item.key;
                       const isLoading = productActionBusy === item.key;
+                      const dropped = isProductDropped(item);
+                      const dropDiff = Math.max(
+                        item.lastDropAmount,
+                        Number((item.pagePrice - item.finalPrice).toFixed(2)),
+                      );
                       return (
                         <div
                           key={item.key}
@@ -1241,6 +1511,13 @@ function App() {
                                 <span className={item.inStock ? 'status-text green' : 'status-text red'}>
                                   {item.stockText}
                                 </span>
+                                {dropped ? (
+                                  <span className="apple-badge green">
+                                    已降 ¥{dropDiff.toFixed(0)}
+                                  </span>
+                                ) : (
+                                  <span className="apple-badge neutral">未降价</span>
+                                )}
                                 {item.finalPrice <= item.allTimeLow && (
                                   <span className="apple-badge blue">史低</span>
                                 )}
@@ -1416,6 +1693,16 @@ function App() {
                           ? '切换京东账号'
                           : '展开京东扫码 / 验证码登录'}
                     </button>
+                    {jdSession?.state === 'logged_in' && (
+                      <button
+                        type="button"
+                        className="apple-btn-danger sm"
+                        disabled={jdBusy}
+                        onClick={logoutJdSession}
+                      >
+                        退出京东账号
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -1540,12 +1827,12 @@ function App() {
               </div>
             </section>
 
-            {/* 第二排：淘宝 / 天猫 (Taobao / Tmall) */}
+            {/* 第二排：淘宝 / 天猫 (Taobao / Tmall) —— 与京东完全一致的网页内直接扫码 + 手机号短信验证码双登录 */}
             <section className="apple-surface settings-surface">
               <div className="surface-header">
                 <div>
                   <h2>淘宝 / 天猫 (Taobao / Tmall) 平台账号与服务端长效会话</h2>
-                  <p>支持扫码登录淘宝与天猫账号，同步后 Cookie 同样持久化保存在服务端本地</p>
+                  <p>支持网页内二维码扫码或手机号短信验证码登录，Cookie 长期保存在服务端并每 10 分钟自动保活</p>
                 </div>
                 <span className={`apple-badge ${tbSession?.state === 'logged_in' ? 'green' : 'neutral'}`}>
                   {tbSession?.state === 'logged_in' ? '已登录' : '未登录'}
@@ -1573,39 +1860,177 @@ function App() {
                     </div>
                     <div className="account-cell">
                       <span>服务端保活机制</span>
-                      <strong>{tbSession?.state === 'logged_in' ? '服务端持久化保持' : '登录后自动保存'}</strong>
+                      <strong>{tbSession?.state === 'logged_in' ? '每 10 分钟自动续期' : '登录后自动开启'}</strong>
                     </div>
                   </div>
 
                   <div className="button-group">
-                    <button
-                      type="button"
-                      className="apple-btn-primary sm"
-                      disabled={tbBusy}
-                      onClick={openTaobaoLogin}
-                    >
-                      打开淘宝扫码登录
-                    </button>
-                    <button
-                      type="button"
-                      className="apple-btn-secondary sm"
-                      disabled={tbBusy}
-                      onClick={checkTaobaoSession}
-                    >
-                      同步并检查淘宝状态
-                    </button>
                     {tbSession?.state === 'logged_in' && (
                       <button
                         type="button"
-                        className="apple-btn-secondary sm"
+                        className="apple-btn-primary sm"
                         disabled={tbBusy}
                         onClick={keepAliveTaobao}
                       >
                         立即保活刷新
                       </button>
                     )}
+                    <button
+                      type="button"
+                      className="apple-btn-secondary sm"
+                      disabled={tbBusy}
+                      onClick={checkTaobaoSession}
+                    >
+                      检查淘宝状态
+                    </button>
+                    <button
+                      type="button"
+                      className="apple-btn-secondary sm"
+                      disabled={tbBusy}
+                      onClick={() => {
+                        setShowTbAuthPanel(prev => !prev);
+                        if (!showTbAuthPanel && tbAuthTab === 'qrcode' && !tbQr) {
+                          void startTaobaoQrLogin();
+                        }
+                      }}
+                    >
+                      {showTbAuthPanel
+                        ? '收起淘宝登录面板'
+                        : tbSession?.state === 'logged_in'
+                          ? '切换淘宝账号'
+                          : '展开淘宝扫码 / 验证码登录'}
+                    </button>
+                    {tbSession?.state === 'logged_in' && (
+                      <button
+                        type="button"
+                        className="apple-btn-danger sm"
+                        disabled={tbBusy}
+                        onClick={logoutTaobaoSession}
+                      >
+                        退出淘宝账号
+                      </button>
+                    )}
                   </div>
                 </div>
+
+                {(tbSession?.state !== 'logged_in' || showTbAuthPanel) && (
+                  <div className="apple-auth-group">
+                    <div className="apple-segmented">
+                      <button
+                        type="button"
+                        className={tbAuthTab === 'qrcode' ? 'active' : ''}
+                        onClick={() => {
+                          setTbAuthTab('qrcode');
+                          if (!tbQr) void startTaobaoQrLogin();
+                        }}
+                      >
+                        淘宝 App 扫码登录
+                      </button>
+                      <button
+                        type="button"
+                        className={tbAuthTab === 'sms' ? 'active' : ''}
+                        onClick={() => setTbAuthTab('sms')}
+                      >
+                        手机号短信验证码登录
+                      </button>
+                    </div>
+
+                    {tbAuthTab === 'qrcode' ? (
+                      <div className="apple-qr-panel">
+                        {!tbQr?.qrImage ? (
+                          <div className="button-group">
+                            <button
+                              type="button"
+                              className="apple-btn-primary sm"
+                              disabled={tbBusy}
+                              onClick={startTaobaoQrLogin}
+                            >
+                              获取淘宝登录二维码
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="qr-card-row">
+                            <div className="qr-image-frame">
+                              <img src={tbQr.qrImage} alt="淘宝扫码登录" width={138} height={138} />
+                              {['qr_expired', 'qr_cancelled'].includes(tbQr.state) && (
+                                <div className="qr-mask-layer">
+                                  <span>{tbQr.state === 'qr_expired' ? '二维码已过期' : '已取消扫码'}</span>
+                                  <button
+                                    type="button"
+                                    className="apple-btn-primary sm"
+                                    onClick={startTaobaoQrLogin}
+                                  >
+                                    刷新
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                            <div className="qr-copy">
+                              <strong>使用手机淘宝 App 扫码登录</strong>
+                              <p>{tbQr.message}</p>
+                              <span>手机确认后二维码将立即自动关闭，登录态持久保存于服务端。</span>
+                              <div className="button-group">
+                                <button
+                                  type="button"
+                                  className="apple-btn-secondary sm"
+                                  disabled={tbBusy}
+                                  onClick={startTaobaoQrLogin}
+                                >
+                                  刷新二维码
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <form className="apple-sms-form" onSubmit={submitTaobaoSmsLogin}>
+                        <div className="sms-grid-row">
+                          <div className="apple-field">
+                            <label htmlFor="tb-phone">淘宝绑定手机号</label>
+                            <div className="field-inline">
+                              <input
+                                id="tb-phone"
+                                type="tel"
+                                maxLength={11}
+                                required
+                                value={tbMobileInput}
+                                onChange={e => setTbMobileInput(e.target.value)}
+                                placeholder="输入 11 位手机号"
+                              />
+                              <button
+                                type="button"
+                                className="apple-btn-secondary"
+                                disabled={tbBusy || tbSmsCountdown > 0}
+                                onClick={sendTaobaoSmsCode}
+                              >
+                                {tbSmsCountdown > 0 ? `${tbSmsCountdown}s 后重发` : '获取验证码'}
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="apple-field">
+                            <label htmlFor="tb-code">短信验证码</label>
+                            <div className="field-inline">
+                              <input
+                                id="tb-code"
+                                type="text"
+                                maxLength={6}
+                                required
+                                value={tbSmsCodeInput}
+                                onChange={e => setTbSmsCodeInput(e.target.value)}
+                                placeholder="输入收到的短信验证码"
+                              />
+                              <button type="submit" className="apple-btn-primary" disabled={tbBusy}>
+                                {tbBusy ? '登录中…' : '登录并保存'}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </form>
+                    )}
+                  </div>
+                )}
               </div>
             </section>
           </main>

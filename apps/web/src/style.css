@@ -330,10 +330,38 @@ body {
 }
 
 .apple-btn-primary.sm,
-.apple-btn-secondary.sm {
+.apple-btn-secondary.sm,
+.apple-btn-danger.sm {
   height: 32px;
   padding: 0 14px;
   font-size: 12.5px;
+}
+
+.apple-btn-danger {
+  height: 38px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 980px;
+  background: oklch(0.950 0.025 26);
+  color: var(--apple-red);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  transition: background-color 180ms ease;
+}
+
+.apple-btn-danger:hover:not(:disabled) {
+  background: oklch(0.920 0.040 26);
+}
+
+.apple-btn-danger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* Apple Stocks 主从双栏面板（全宽自适应铺满右侧工作区，无右侧留白） */
@@ -378,10 +406,73 @@ body {
   font-weight: 500;
 }
 
-/* 左侧商品列表 */
+/* 左侧商品列表与搜索筛选栏 */
+.watchlist-toolbar {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--apple-divider);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.watchlist-search-box {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.watchlist-search-box input {
+  width: 100%;
+  height: 34px;
+  padding: 0 48px 0 12px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--apple-canvas);
+  color: var(--apple-ink);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+
+.watchlist-search-box input::placeholder {
+  color: var(--apple-secondary);
+}
+
+.watchlist-search-box input:focus {
+  box-shadow: 0 0 0 2px var(--apple-blue-tint);
+}
+
+.clear-search-btn {
+  position: absolute;
+  right: 8px;
+  border: 0;
+  background: transparent;
+  color: var(--apple-blue);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.apple-segmented.full-width {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  width: 100%;
+}
+
+.apple-segmented.full-width button {
+  padding: 5px 4px;
+  font-size: 11.5px;
+  text-align: center;
+  white-space: nowrap;
+}
+
 .apple-list {
   display: flex;
   flex-direction: column;
+  max-height: 680px;
+  overflow-y: auto;
 }
 
 .apple-list-item {

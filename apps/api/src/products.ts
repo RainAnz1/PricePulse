@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Request } from 'express';
 import { ProductIdentity, resolveAndParseProductUrl } from './product-url';
-import { getDataRoot, getJdHeadlessContext, loadPersistedJdSession } from './sessions';
+import { getDataRoot, getJdHeadlessContext, loadPersistedJdSession, loadPersistedTaobaoSession } from './sessions';
 import { notifyDelistToFeishu, notifyPriceDropToFeishu } from './feishu';
 
 export interface PriceHistoryPoint {
@@ -417,13 +417,17 @@ async function scrapeJdProduct(identity: ProductIdentity): Promise<{
 }
 
 async function scrapeTaobaoProduct(identity: ProductIdentity) {
+  const tbSession = loadPersistedTaobaoSession();
   const skuLabel = identity.skuId ? `规格 ${identity.skuId}` : '标准规格';
   let title = `淘宝/天猫商品 #${identity.id}`;
   let pagePrice = 1299;
 
   try {
     const res = await fetch(identity.canonicalUrl, {
-      headers: { 'User-Agent': MOBILE_UA },
+      headers: {
+        'User-Agent': MOBILE_UA,
+        ...(tbSession?.cookieHeader ? { Cookie: tbSession.cookieHeader } : {}),
+      },
     });
     const html = await res.text();
     const titleMatch = html.match(/<title>([^<]+)<\/title>/i);

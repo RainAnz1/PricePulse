@@ -11,7 +11,7 @@ import {
   Req,
 } from '@nestjs/common';
 import { chromium, BrowserContext, Page } from 'playwright';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { Request } from 'express';
 import { notifySessionExpiredToFeishu } from './feishu';
@@ -62,6 +62,19 @@ interface ActiveJdQrSession {
   ticket?: string;
 }
 
+interface ActiveTaobaoQrSession {
+  t: number;
+  ck: string;
+  codeContent: string;
+  csrf: string;
+  qrImage: string;
+  createdAt: number;
+  expiresAt: number;
+  lastStatus: 'NEW' | 'SCANED' | 'CONFIRMED' | 'EXPIRED' | 'CANCELED' | 'ERROR';
+  lastMessage: string;
+  redirectUrl?: string;
+}
+
 const JD_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const JD_LOGIN_PAGE_URL = 'https://passport.jd.com/new/login.aspx';
@@ -69,6 +82,12 @@ const JD_QR_SHOW_URL = 'https://qr.m.jd.com/show';
 const JD_QR_CHECK_URL = 'https://qr.m.jd.com/check';
 const JD_QR_VALIDATE_URL = 'https://passport.jd.com/uc/qrCodeTicketValidation';
 const JD_LOGIN_VERIFY_URL = 'https://passport.jd.com/loginservice.aspx';
+
+const TB_LOGIN_PAGE_URL = 'https://login.taobao.com/havanaone/login/login.htm?bizName=taobao&sub=true';
+const TB_QR_GENERATE_URL = 'https://login.taobao.com/havanaone/loginLegacy/qrCode/generate.do';
+const TB_QR_QUERY_URL = 'https://login.taobao.com/havanaone/loginLegacy/qrCode/query.do';
+const TB_SMS_SEND_URL = 'https://login.taobao.com/havanaone/loginLegacy/sms/sendSms.do';
+const TB_SMS_LOGIN_URL = 'https://login.taobao.com/havanaone/loginLegacy/sms/login.do';
 
 const urls: Record<Platform, string> = { jd: 'https://www.jd.com/', taobao: 'https://www.taobao.com/' };
 const contexts = new Map<Platform, BrowserContext>();
@@ -78,6 +97,12 @@ let activeJdQrSession: ActiveJdQrSession | null = null;
 let headlessAuthContext: BrowserContext | null = null;
 let headlessAuthLaunching: Promise<BrowserContext> | null = null;
 let headlessLoginPage: Page | null = null;
+
+let activeTaobaoQrSession: ActiveTaobaoQrSession | null = null;
+let headlessTbContext: BrowserContext | null = null;
+let headlessTbLaunching: Promise<BrowserContext> | null = null;
+let headlessTbPage: Page | null = null;
+
 let keepAliveTimer: NodeJS.Timeout | null = null;
 
 /**
@@ -117,10 +142,20 @@ export interface PersistedTaobaoSession {
   platform: 'taobao';
   nick: string;
   uid: string;
+  mobile?: string;
   cookies: Record<string, string>;
+  cookieList?: StoredCookieItem[];
   cookieHeader: string;
+  source?: 'qrcode' | 'sms' | 'playwright';
   updatedAt: string;
   lastKeepAliveAt?: string;
+  keepAliveCount?: number;
+  protocolMeta?: {
+    generateEndpoint: string;
+    queryEndpoint: string;
+    sendSmsEndpoint: string;
+    smsLoginEndpoint: string;
+  };
 }
 
 export function loadPersistedTaobaoSession(): PersistedTaobaoSession | null {
@@ -135,11 +170,55 @@ export function loadPersistedTaobaoSession(): PersistedTaobaoSession | null {
   }
 }
 
-export function savePersistedTaobaoSession(session: PersistedTaobaoSession): PersistedTaobaoSession {
+export function savePersistedTaobaoSession(
+  incoming: Partial<PersistedTaobaoSession> & { cookies: Record<string, string> },
+): PersistedTaobaoSession {
+  const existing = loadPersistedTaobaoSession();
+  const mergedCookies: Record<string, string> = {
+    ...(existing?.cookies || {}),
+    ...incoming.cookies,
+  };
+  const rawNick =
+    incoming.nick ||
+    decodeCookieValue(mergedCookies.tracknick || mergedCookies._nk_ || mergedCookies.lgc || mergedCookies.dnk) ||
+    existing?.nick ||
+    incoming.mobile ||
+    '淘宝用户';
+  const rawUid =
+    incoming.uid ||
+    decodeCookieValue(mergedCookies.unb || mergedCookies.tracknick || mergedCookies.lgc) ||
+    existing?.uid ||
+    rawNick;
+
+  const session: PersistedTaobaoSession = {
+    platform: 'taobao',
+    nick: rawNick,
+    uid: rawUid,
+    mobile: incoming.mobile || existing?.mobile,
+    cookies: mergedCookies,
+    cookieList: incoming.cookieList || existing?.cookieList,
+    cookieHeader: buildCookieHeader(mergedCookies),
+    source: incoming.source || existing?.source || 'qrcode',
+    updatedAt: incoming.updatedAt || new Date().toISOString(),
+    lastKeepAliveAt: incoming.lastKeepAliveAt || existing?.lastKeepAliveAt || new Date().toISOString(),
+    keepAliveCount: incoming.keepAliveCount ?? existing?.keepAliveCount ?? 0,
+    protocolMeta: incoming.protocolMeta ||
+      existing?.protocolMeta || {
+        generateEndpoint: TB_QR_GENERATE_URL,
+        queryEndpoint: TB_QR_QUERY_URL,
+        sendSmsEndpoint: TB_SMS_SEND_URL,
+        smsLoginEndpoint: TB_SMS_LOGIN_URL,
+      },
+  };
+
   const filePath = getTaobaoSessionFilePath();
   mkdirSync(dirname(filePath), { recursive: true });
   writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
   return session;
+}
+
+function getTaobaoHeadlessProfilePath(): string {
+  return join(getDataRoot(), 'PriceDrop', 'browser-profiles', 'taobao-headless');
 }
 
 function getJdHeadlessProfilePath(): string {
@@ -505,6 +584,157 @@ export async function runJdSessionKeepAlive(): Promise<{
   };
 }
 
+/**
+ * 获取淘宝服务端常驻无头浏览器上下文（用于执行淘宝二维码生成、扫码状态轮询、短信验证码登录与 Cookie 持久化）
+ */
+export async function getTaobaoHeadlessContext(): Promise<BrowserContext> {
+  if (headlessTbContext) return headlessTbContext;
+  if (headlessTbLaunching) return headlessTbLaunching;
+
+  const task = (async () => {
+    const profileDir = getTaobaoHeadlessProfilePath();
+    mkdirSync(profileDir, { recursive: true });
+    let context: BrowserContext;
+    try {
+      context = await chromium.launchPersistentContext(profileDir, {
+        channel: 'chrome',
+        headless: true,
+        userAgent: JD_UA,
+        viewport: { width: 1280, height: 800 },
+      });
+    } catch {
+      context = await chromium.launchPersistentContext(profileDir, {
+        headless: true,
+        userAgent: JD_UA,
+        viewport: { width: 1280, height: 800 },
+      });
+    }
+
+    const existing = loadPersistedTaobaoSession();
+    if (existing) {
+      try {
+        const toAdd =
+          existing.cookieList && existing.cookieList.length > 0
+            ? existing.cookieList.map(c => ({
+                name: c.name,
+                value: c.value,
+                domain: c.domain || '.taobao.com',
+                path: c.path || '/',
+              }))
+            : Object.entries(existing.cookies).map(([name, value]) => ({
+                name,
+                value: String(value),
+                domain: '.taobao.com',
+                path: '/',
+              }));
+        if (toAdd.length > 0) {
+          await context.addCookies(toAdd);
+        }
+      } catch {
+        // ignore cookie injection warning
+      }
+    }
+
+    headlessTbContext = context;
+    context.on('close', () => {
+      if (headlessTbContext === context) {
+        headlessTbContext = null;
+        headlessTbPage = null;
+      }
+    });
+    return context;
+  })();
+
+  headlessTbLaunching = task;
+  try {
+    return await task;
+  } finally {
+    headlessTbLaunching = null;
+  }
+}
+
+async function syncTaobaoCookiesFromHeadlessContext(
+  extraCookies: Record<string, string> = {},
+  source: 'qrcode' | 'sms' = 'qrcode',
+  mobile?: string,
+): Promise<PersistedTaobaoSession> {
+  const context = await getTaobaoHeadlessContext();
+  const browserCookies = await context.cookies([
+    'https://www.taobao.com',
+    'https://www.tmall.com',
+    'https://login.taobao.com',
+    'https://i.taobao.com',
+  ]);
+  const cookieMap: Record<string, string> = { ...extraCookies };
+  const cookieList: StoredCookieItem[] = [];
+
+  for (const c of browserCookies) {
+    if (c.name && c.value && c.value !== 'deleted') {
+      cookieMap[c.name] = c.value;
+      cookieList.push({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        path: c.path,
+        expires: c.expires,
+        httpOnly: c.httpOnly,
+        secure: c.secure,
+      });
+    }
+  }
+
+  return savePersistedTaobaoSession({
+    cookies: cookieMap,
+    cookieList,
+    source,
+    mobile,
+    updatedAt: new Date().toISOString(),
+    lastKeepAliveAt: new Date().toISOString(),
+  });
+}
+
+export async function runTaobaoSessionKeepAlive(): Promise<{
+  ok: boolean;
+  session: PersistedTaobaoSession | null;
+  message: string;
+}> {
+  const session = loadPersistedTaobaoSession();
+  if (!session) {
+    return { ok: false, session: null, message: '尚未保存淘宝登录态' };
+  }
+
+  const mergedCookies = { ...session.cookies };
+  try {
+    const res = await fetch('https://www.taobao.com/', {
+      headers: {
+        'User-Agent': JD_UA,
+        Cookie: buildCookieHeader(mergedCookies),
+      },
+    });
+    const setCookies =
+      typeof res.headers.getSetCookie === 'function'
+        ? res.headers.getSetCookie()
+        : [res.headers.get('set-cookie') || ''].filter(Boolean);
+    Object.assign(mergedCookies, parseSetCookieHeaders(setCookies));
+  } catch {
+    // ignore transient error
+  }
+
+  const updated = savePersistedTaobaoSession({
+    ...session,
+    cookies: mergedCookies,
+    updatedAt: session.updatedAt,
+    lastKeepAliveAt: new Date().toISOString(),
+    keepAliveCount: (session.keepAliveCount ?? 0) + 1,
+  });
+
+  return {
+    ok: true,
+    session: updated,
+    message: `淘宝服务端保活完成（账号：${updated.nick}，累计保活 ${updated.keepAliveCount} 次）`,
+  };
+}
+
 async function open(platform: Platform): Promise<BrowserContext> {
   const active = contexts.get(platform);
   if (active) return active;
@@ -540,9 +770,10 @@ async function open(platform: Platform): Promise<BrowserContext> {
 export class SessionsController implements OnModuleInit {
   onModuleInit() {
     if (!keepAliveTimer) {
-      // 每 10 分钟在服务端后台执行一次京东登录态保活心跳
+      // 每 10 分钟在服务端后台执行一次京东与淘宝登录态保活心跳
       keepAliveTimer = setInterval(() => {
         void runJdSessionKeepAlive();
+        void runTaobaoSessionKeepAlive();
       }, 10 * 60 * 1000);
       keepAliveTimer.unref?.();
     }
@@ -1078,7 +1309,493 @@ export class SessionsController implements OnModuleInit {
   }
 
   /**
-   * 7. 查询服务端已保存的淘宝 / 天猫登录态详情
+   * 6b. 退出京东账号并清除服务端持久化 Cookie
+   */
+  @Post('jd/logout')
+  async logoutJd(@Req() req: Request) {
+    validateOrigin(req);
+    const filePath = getJdSessionFilePath();
+    if (existsSync(filePath)) {
+      try {
+        unlinkSync(filePath);
+      } catch {
+        // ignore unlink error
+      }
+    }
+    activeJdQrSession = null;
+    if (headlessAuthContext) {
+      await headlessAuthContext.clearCookies().catch(() => {});
+    }
+    const jdBrowser = contexts.get('jd');
+    if (jdBrowser) {
+      await jdBrowser.clearCookies().catch(() => {});
+    }
+    return {
+      state: 'login_required',
+      nickname: '未登录',
+      pin: '—',
+      cookieCount: 0,
+      message: '已退出京东账号，服务端持久化登录态已清除',
+    };
+  }
+
+  /**
+   * 7. 获取淘宝网页内扫码登录二维码
+   * 底层协议：GET https://login.taobao.com/havanaone/loginLegacy/qrCode/generate.do?bizEntrance=taobao_pc&bizName=taobao
+   * 返回字段：{ hasError: false, content: { status: 0, data: { t, codeContent, ck, resultCode: 100 }, success: true } }
+   */
+  @Post('taobao/qrcode/start')
+  async startTaobaoQrCode(@Req() req: Request) {
+    validateOrigin(req);
+    const context = await getTaobaoHeadlessContext();
+    if (!headlessTbPage || headlessTbPage.isClosed()) {
+      headlessTbPage = await context.newPage();
+    }
+    const page = headlessTbPage;
+
+    let capturedGen: { t?: number; ck?: string; codeContent?: string; resultCode?: number } | null = null;
+
+    const onResponse = async (res: { url: () => string; json: () => Promise<unknown> }) => {
+      const u = res.url();
+      if (u.includes('qrCode/generate.do')) {
+        try {
+          const json = (await res.json()) as {
+            content?: { data?: { t?: number; ck?: string; codeContent?: string; resultCode?: number } };
+          };
+          if (json?.content?.data?.ck) {
+            capturedGen = json.content.data;
+          }
+        } catch {
+          // ignore
+        }
+      } else if (u.includes('qrCode/query.do') && activeTaobaoQrSession) {
+        try {
+          const json = (await res.json()) as {
+            content?: {
+              data?: {
+                qrCodeStatus?: 'NEW' | 'SCANED' | 'CONFIRMED' | 'EXPIRED' | 'CANCELED' | 'ERROR';
+                titleMsg?: string;
+                redirectUrl?: string;
+                iframeRedirectUrl?: string;
+              };
+            };
+          };
+          const d = json?.content?.data;
+          if (d?.qrCodeStatus) {
+            activeTaobaoQrSession.lastStatus = d.qrCodeStatus;
+            activeTaobaoQrSession.lastMessage = d.titleMsg || '';
+            if (d.redirectUrl || d.iframeRedirectUrl) {
+              activeTaobaoQrSession.redirectUrl = d.redirectUrl || d.iframeRedirectUrl;
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    page.removeAllListeners('response');
+    page.on('response', onResponse);
+
+    await page.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'networkidle', timeout: 25000 });
+
+    // 如果当前页面处于快速确认登录视图 (hasLogin)，点击“使用其他账号登录”切换到二维码视图
+    await page
+      .evaluate(() => {
+        const otherLink = Array.from(document.querySelectorAll('a')).find(a =>
+          (a.textContent || '').includes('使用其他账号登录'),
+        );
+        if (otherLink) otherLink.click();
+      })
+      .catch(() => {});
+
+    const canvasLoc = page.locator('canvas').first();
+    await canvasLoc.waitFor({ state: 'visible', timeout: 10000 });
+    await page.waitForTimeout(350);
+
+    const meta = await page.evaluate(async () => {
+      const w = window as unknown as {
+        viewData?: { loginFormData?: { _csrf?: string } };
+      };
+      const csrf = w.viewData?.loginFormData?._csrf || '';
+      return { csrf };
+    });
+
+    if (!capturedGen) {
+      // 主动调用一次 generate.do 获取 t, ck, codeContent
+      const directGen = await page
+        .evaluate(async (csrf: string) => {
+          const r = await fetch(
+            `/havanaone/loginLegacy/qrCode/generate.do?bizEntrance=taobao_pc&bizName=taobao&sub=true&hitRSA2048Gray=true&_csrf=${encodeURIComponent(
+              csrf,
+            )}&lang=zh_CN&umidToken=&umidTag=NOT_INIT`,
+            { credentials: 'include' },
+          );
+          const j = (await r.json()) as {
+            content?: { data?: { t?: number; ck?: string; codeContent?: string; resultCode?: number } };
+          };
+          return j?.content?.data || null;
+        }, meta.csrf)
+        .catch(() => null);
+      if (directGen) capturedGen = directGen;
+    }
+
+    const pngBuffer = await canvasLoc.screenshot({ type: 'png' });
+    const qrImage = `data:image/png;base64,${pngBuffer.toString('base64')}`;
+    const now = Date.now();
+    const genInfo = (capturedGen || {}) as { t?: number; ck?: string; codeContent?: string };
+    const tVal = genInfo.t || now;
+    const ckVal = genInfo.ck || `qr_code_sm2_${now}`;
+    const codeContentVal =
+      genInfo.codeContent ||
+      `https://login.m.taobao.com/qrcodeCheck.htm?lgToken=${ckVal}&tbScanOpenType=Notification`;
+
+    activeTaobaoQrSession = {
+      t: tVal,
+      ck: ckVal,
+      codeContent: codeContentVal,
+      csrf: meta.csrf,
+      qrImage,
+      createdAt: now,
+      expiresAt: now + 120_000,
+      lastStatus: 'NEW',
+      lastMessage: '二维码未扫描，请打开手机淘宝 App 扫码登录',
+    };
+
+    return {
+      state: 'qr_ready',
+      qrImage,
+      token: ckVal,
+      t: tVal,
+      codeContent: codeContentVal,
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(activeTaobaoQrSession.expiresAt).toISOString(),
+      protocol: {
+        generateUrl: TB_QR_GENERATE_URL,
+        queryUrl: TB_QR_QUERY_URL,
+      },
+      message: '请打开手机淘宝 App 扫描下方二维码登录',
+    };
+  }
+
+  /**
+   * 7b. 轮询淘宝二维码扫码状态
+   * 底层协议：POST https://login.taobao.com/havanaone/loginLegacy/qrCode/query.do?bizEntrance=taobao_pc&bizName=taobao
+   * 请求体：t={t}&ck={ck}&sub=true&hitRSA2048Gray=true&bizEntrance=taobao_pc&bizName=taobao&_csrf={_csrf}&lang=zh_CN
+   * 返回体：{ hasError: false, content: { status: 0, data: { qrCodeStatus: "NEW"|"SCANED"|"CONFIRMED"|"EXPIRED"|"CANCELED", titleMsg, resultCode: 100 } } }
+   */
+  @Get('taobao/qrcode/status')
+  async checkTaobaoQrStatus(@Req() req: Request) {
+    validateOrigin(req);
+    if (!activeTaobaoQrSession) {
+      return {
+        state: 'qr_none',
+        code: 0,
+        message: '当前没有进行中的淘宝扫码会话',
+      };
+    }
+
+    if (Date.now() > activeTaobaoQrSession.expiresAt) {
+      return {
+        state: 'qr_expired',
+        code: 103,
+        qrCodeStatus: 'EXPIRED',
+        message: '淘宝二维码已超时失效，请点击刷新重新获取二维码',
+      };
+    }
+
+    // 检查无头页面是否已完成扫码跳转或下发了最新 query.do 状态
+    if (headlessTbPage && !headlessTbPage.isClosed()) {
+      const pageUrl = headlessTbPage.url();
+      if (
+        !pageUrl.includes('login.taobao.com') &&
+        (pageUrl.includes('taobao.com') || pageUrl.includes('tmall.com'))
+      ) {
+        activeTaobaoQrSession.lastStatus = 'CONFIRMED';
+      } else if (activeTaobaoQrSession.lastStatus === 'NEW' || activeTaobaoQrSession.lastStatus === 'SCANED') {
+        // 在无头页面上下文中调用一次 query.do 获取最新实时状态
+        const queryData = await headlessTbPage
+          .evaluate(
+            async ({ t, ck, csrf }: { t: number; ck: string; csrf: string }) => {
+              const body = new URLSearchParams({
+                t: String(t),
+                ck,
+                ua: '',
+                sub: 'true',
+                hitRSA2048Gray: 'true',
+                bizEntrance: 'taobao_pc',
+                bizName: 'taobao',
+                _csrf: csrf,
+                lang: 'zh_CN',
+                umidToken: '',
+                umidTag: 'NOT_INIT',
+                navlanguage: 'zh-CN',
+                navUserAgent: navigator.userAgent,
+                navPlatform: navigator.platform || 'MacIntel',
+                isIframe: 'false',
+                banThirdPartyCookie: 'true',
+                documentReferer: '',
+                defaultView: 'qrcode',
+              });
+              const r = await fetch('/havanaone/loginLegacy/qrCode/query.do?bizEntrance=taobao_pc&bizName=taobao', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString(),
+              });
+              const j = (await r.json()) as {
+                content?: {
+                  data?: {
+                    qrCodeStatus?: 'NEW' | 'SCANED' | 'CONFIRMED' | 'EXPIRED' | 'CANCELED' | 'ERROR';
+                    titleMsg?: string;
+                    redirectUrl?: string;
+                    iframeRedirectUrl?: string;
+                    asyncUrls?: string[];
+                  };
+                };
+              };
+              return j?.content?.data || null;
+            },
+            {
+              t: activeTaobaoQrSession.t,
+              ck: activeTaobaoQrSession.ck,
+              csrf: activeTaobaoQrSession.csrf,
+            },
+          )
+          .catch(() => null);
+
+        if (queryData?.qrCodeStatus) {
+          activeTaobaoQrSession.lastStatus = queryData.qrCodeStatus;
+          activeTaobaoQrSession.lastMessage = queryData.titleMsg || activeTaobaoQrSession.lastMessage;
+          const targetRedirect = queryData.redirectUrl || queryData.iframeRedirectUrl || queryData.asyncUrls?.[0];
+          if (targetRedirect) {
+            activeTaobaoQrSession.redirectUrl = targetRedirect;
+          }
+        }
+      }
+    }
+
+    switch (activeTaobaoQrSession.lastStatus) {
+      case 'NEW':
+        return {
+          state: 'qr_waiting',
+          code: 100,
+          qrCodeStatus: 'NEW',
+          message: activeTaobaoQrSession.lastMessage || '二维码未扫描，请打开手机淘宝 App 扫一扫',
+        };
+      case 'SCANED':
+        return {
+          state: 'qr_scanned',
+          code: 101,
+          qrCodeStatus: 'SCANED',
+          message: '扫描成功！请在手机淘宝 App 上点击「确认登录」',
+        };
+      case 'EXPIRED':
+        return {
+          state: 'qr_expired',
+          code: 103,
+          qrCodeStatus: 'EXPIRED',
+          message: '淘宝二维码已失效，请点击刷新二维码',
+        };
+      case 'CANCELED':
+      case 'ERROR':
+        return {
+          state: 'qr_cancelled',
+          code: 105,
+          qrCodeStatus: activeTaobaoQrSession.lastStatus,
+          message: activeTaobaoQrSession.lastMessage || '已在手机端取消扫码登录，请重新获取二维码',
+        };
+      case 'CONFIRMED': {
+        if (activeTaobaoQrSession.redirectUrl && headlessTbPage && !headlessTbPage.isClosed()) {
+          await headlessTbPage
+            .goto(activeTaobaoQrSession.redirectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 })
+            .catch(() => {});
+        }
+        const saved = await syncTaobaoCookiesFromHeadlessContext({}, 'qrcode');
+        activeTaobaoQrSession = null;
+        return {
+          state: 'logged_in',
+          code: 200,
+          qrCodeStatus: 'CONFIRMED',
+          nickname: saved.nick,
+          pin: saved.uid,
+          source: saved.source,
+          updatedAt: saved.updatedAt,
+          lastKeepAliveAt: saved.lastKeepAliveAt,
+          cookieCount: Object.keys(saved.cookies).length,
+          storagePath: getTaobaoSessionFilePath(),
+          message: `淘宝扫码登录成功（账号：${saved.nick}），登录态已长期保存在服务端`,
+        };
+      }
+    }
+  }
+
+  /**
+   * 7c. 淘宝手机号短信验证码登录 — 发送验证码
+   * 底层协议：POST https://login.taobao.com/havanaone/loginLegacy/sms/sendSms.do?bizEntrance=taobao_pc&bizName=taobao
+   */
+  @Post('taobao/sms/send')
+  async sendTaobaoSmsCode(@Body() body: { mobile?: string }, @Req() req: Request) {
+    validateOrigin(req);
+    const mobile = (body?.mobile || '').trim();
+    if (!/^1[3-9]\d{9}$/.test(mobile)) {
+      throw new BadRequestException('请输入有效的 11 位中国大陆手机号码');
+    }
+
+    const context = await getTaobaoHeadlessContext();
+    if (!headlessTbPage || headlessTbPage.isClosed()) {
+      headlessTbPage = await context.newPage();
+      await headlessTbPage.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'networkidle', timeout: 25000 });
+    }
+    const page = headlessTbPage;
+    if (!page.url().includes('login.taobao.com')) {
+      await page.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'networkidle', timeout: 25000 });
+    }
+
+    // 切换到短信验证码登录 Tab
+    await page
+      .evaluate(() => {
+        const otherLink = Array.from(document.querySelectorAll('a')).find(a =>
+          (a.textContent || '').includes('使用其他账号登录'),
+        );
+        if (otherLink) otherLink.click();
+        const smsTab = document.querySelector('.sms-login-tab-item') as HTMLElement | null;
+        if (smsTab) smsTab.click();
+      })
+      .catch(() => {});
+
+    await page.waitForTimeout(400);
+
+    let sendApiRes: { content?: { data?: { resultCode?: number; titleMsg?: string }; success?: boolean } } | null =
+      null;
+    const responsePromise = page
+      .waitForResponse(res => res.url().includes('sms/sendSms.do'), { timeout: 8000 })
+      .then(async res => {
+        sendApiRes = (await res.json()) as {
+          content?: { data?: { resultCode?: number; titleMsg?: string }; success?: boolean };
+        };
+      })
+      .catch(() => {});
+
+    await page.fill('#fm-sms-login-id', mobile).catch(() => {});
+    await page
+      .evaluate(() => {
+        const agree = document.querySelector('#fm-agreement-checkbox') as HTMLInputElement | null;
+        if (agree && !agree.checked) agree.click();
+        const sendBtn = document.querySelector('.send-btn-link') as HTMLElement | null;
+        if (sendBtn) sendBtn.click();
+      })
+      .catch(() => {});
+
+    await responsePromise;
+
+    const sendRes = sendApiRes as {
+      content?: { data?: { resultCode?: number; titleMsg?: string }; success?: boolean };
+    } | null;
+    const resultCode = sendRes?.content?.data?.resultCode;
+    if (resultCode === 100 || sendRes?.content?.success) {
+      return {
+        ok: true,
+        state: 'sms_sent',
+        mobile,
+        countdown: 60,
+        raw: sendRes,
+        message: `淘宝短信验证码已发送至 ${mobile}，请输入收到的验证码`,
+      };
+    }
+
+    const errMsg =
+      sendRes?.content?.data?.titleMsg ||
+      '淘宝短信接口触发滑块安全验证，请优先切换至「淘宝 App 扫码登录」直接扫码';
+    throw new BadRequestException(errMsg);
+  }
+
+  /**
+   * 7d. 淘宝手机号短信验证码登录 — 提交验证码并持久化 Cookie
+   * 底层协议：POST https://login.taobao.com/havanaone/loginLegacy/sms/login.do?bizEntrance=taobao_pc&bizName=taobao
+   */
+  @Post('taobao/sms/login')
+  async loginTaobaoWithSms(@Body() body: { mobile?: string; code?: string }, @Req() req: Request) {
+    validateOrigin(req);
+    const mobile = (body?.mobile || '').trim();
+    const code = (body?.code || '').trim();
+    if (!/^1[3-9]\d{9}$/.test(mobile)) {
+      throw new BadRequestException('请输入有效的 11 位手机号码');
+    }
+    if (!/^\d{4,6}$/.test(code)) {
+      throw new BadRequestException('请输入有效的短信验证码');
+    }
+
+    if (!headlessTbPage || headlessTbPage.isClosed()) {
+      throw new BadRequestException('请先点击「获取验证码」发送短信');
+    }
+    const page = headlessTbPage;
+
+    let loginApiRes: {
+      content?: {
+        data?: { resultCode?: number; titleMsg?: string; redirectUrl?: string; iframeRedirectUrl?: string };
+        success?: boolean;
+      };
+    } | null = null;
+
+    const responsePromise = page
+      .waitForResponse(res => res.url().includes('sms/login.do'), { timeout: 10000 })
+      .then(async res => {
+        loginApiRes = (await res.json()) as {
+          content?: {
+            data?: { resultCode?: number; titleMsg?: string; redirectUrl?: string; iframeRedirectUrl?: string };
+            success?: boolean;
+          };
+        };
+      })
+      .catch(() => {});
+
+    await page.fill('#fm-sms-login-id', mobile).catch(() => {});
+    await page.fill('#fm-smscode', code).catch(() => {});
+    await page
+      .evaluate(() => {
+        const agree = document.querySelector('#fm-agreement-checkbox') as HTMLInputElement | null;
+        if (agree && !agree.checked) agree.click();
+        const submitBtn = document.querySelector('button.sms-login, button.fm-submit') as HTMLElement | null;
+        if (submitBtn) submitBtn.click();
+      })
+      .catch(() => {});
+
+    await responsePromise;
+
+    const loginRes = loginApiRes as {
+      content?: {
+        data?: { resultCode?: number; titleMsg?: string; redirectUrl?: string; iframeRedirectUrl?: string };
+        success?: boolean;
+      };
+    } | null;
+    const resData = loginRes?.content?.data;
+    if (resData?.resultCode === 100 || (!page.url().includes('login.taobao.com') && page.url().includes('taobao.com'))) {
+      const targetUrl = resData?.redirectUrl || resData?.iframeRedirectUrl;
+      if (targetUrl) {
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+      }
+      const saved = await syncTaobaoCookiesFromHeadlessContext({}, 'sms', mobile);
+      activeTaobaoQrSession = null;
+      return {
+        state: 'logged_in',
+        nickname: saved.nick,
+        pin: saved.uid,
+        mobile: saved.mobile,
+        source: saved.source,
+        updatedAt: saved.updatedAt,
+        lastKeepAliveAt: saved.lastKeepAliveAt,
+        cookieCount: Object.keys(saved.cookies).length,
+        storagePath: getTaobaoSessionFilePath(),
+        message: `淘宝手机号验证码登录成功（账号：${saved.nick}），登录态已长期保存在服务端`,
+      };
+    }
+
+    throw new BadRequestException(resData?.titleMsg || '淘宝短信验证码错误或已失效，请重试或使用扫码登录');
+  }
+
+  /**
+   * 7e. 查询服务端已保存的淘宝 / 天猫登录态详情
    */
   @Get('taobao/status')
   async getTaobaoStatus() {
@@ -1088,11 +1805,14 @@ export class SessionsController implements OnModuleInit {
         state: 'logged_in',
         nickname: saved.nick,
         pin: saved.uid || saved.nick,
+        mobile: saved.mobile,
+        source: saved.source || 'qrcode',
         updatedAt: saved.updatedAt,
         lastKeepAliveAt: saved.lastKeepAliveAt || saved.updatedAt,
+        keepAliveCount: saved.keepAliveCount ?? 0,
         cookieCount: Object.keys(saved.cookies).length,
         storagePath: getTaobaoSessionFilePath(),
-        message: `淘宝登录态已保存在服务端（账号：${saved.nick}，共 ${Object.keys(saved.cookies).length} 项 Cookie）`,
+        message: `淘宝登录态已长期保存在服务端（账号：${saved.nick}，共 ${Object.keys(saved.cookies).length} 项 Cookie）`,
       };
     }
     return {
@@ -1100,7 +1820,7 @@ export class SessionsController implements OnModuleInit {
       nickname: '未登录',
       pin: '—',
       cookieCount: 0,
-      message: '尚未保存淘宝 / 天猫登录态，可点击「打开淘宝扫码登录」完成后点击「同步并保存会话」',
+      message: '尚未保存淘宝 / 天猫登录态，请使用下方「淘宝 App 扫码登录」或「手机号短信验证码登录」',
     };
   }
 
@@ -1110,22 +1830,52 @@ export class SessionsController implements OnModuleInit {
   @Post('taobao/keepalive')
   async keepAliveTaobao(@Req() req: Request) {
     validateOrigin(req);
-    const saved = loadPersistedTaobaoSession();
-    if (!saved) {
-      throw new BadRequestException('尚未保存淘宝登录态，请先登录淘宝并同步会话');
+    const res = await runTaobaoSessionKeepAlive();
+    if (!res.ok || !res.session) {
+      throw new BadRequestException(res.message);
     }
-    const updated = savePersistedTaobaoSession({
-      ...saved,
-      lastKeepAliveAt: new Date().toISOString(),
-    });
     return {
       state: 'logged_in',
-      nickname: updated.nick,
-      pin: updated.uid || updated.nick,
-      updatedAt: updated.updatedAt,
-      lastKeepAliveAt: updated.lastKeepAliveAt,
-      cookieCount: Object.keys(updated.cookies).length,
-      message: `淘宝服务端保活完成（账号：${updated.nick}，共 ${Object.keys(updated.cookies).length} 项 Cookie）`,
+      nickname: res.session.nick,
+      pin: res.session.uid || res.session.nick,
+      source: res.session.source,
+      updatedAt: res.session.updatedAt,
+      lastKeepAliveAt: res.session.lastKeepAliveAt,
+      keepAliveCount: res.session.keepAliveCount,
+      cookieCount: Object.keys(res.session.cookies).length,
+      storagePath: getTaobaoSessionFilePath(),
+      message: res.message,
+    };
+  }
+
+  /**
+   * 8b. 退出淘宝账号并清除服务端持久化 Cookie
+   */
+  @Post('taobao/logout')
+  async logoutTaobao(@Req() req: Request) {
+    validateOrigin(req);
+    const filePath = getTaobaoSessionFilePath();
+    if (existsSync(filePath)) {
+      try {
+        unlinkSync(filePath);
+      } catch {
+        // ignore unlink error
+      }
+    }
+    activeTaobaoQrSession = null;
+    if (headlessTbContext) {
+      await headlessTbContext.clearCookies().catch(() => {});
+    }
+    const tbBrowser = contexts.get('taobao');
+    if (tbBrowser) {
+      await tbBrowser.clearCookies().catch(() => {});
+    }
+    return {
+      state: 'login_required',
+      nickname: '未登录',
+      pin: '—',
+      cookieCount: 0,
+      message: '已退出淘宝账号，服务端持久化登录态已清除',
     };
   }
 
