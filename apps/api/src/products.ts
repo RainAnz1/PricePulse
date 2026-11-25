@@ -898,15 +898,19 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
       const mtopPayloads: string[] = [];
       page.on('response', async res => {
         const u = res.url();
+        const isMtopHost = u.includes('h5api.m.taobao.com/h5/mtop.') || u.includes('h5api.m.tmall.com/h5/mtop.');
         if (
-          u.includes('mtop.taobao.pcdetail.data.get') ||
-          u.includes('mtop.taobao.detail.getdetail') ||
-          u.includes('mtop.taobao.detail.data.get')
+          isMtopHost &&
+          (u.includes('mtop.taobao.pcdetail.data.get') ||
+            u.includes('mtop.taobao.detail.getdetail') ||
+            u.includes('mtop.taobao.detail.data.get'))
         ) {
           try {
             const text = await res.text();
-            if (text && !text.includes('RGV587_ERROR') && !text.includes('FAIL_SYS_SESSION_EXPIRED')) {
+            if (text && text.includes('SUCCESS::')) {
               mtopPayloads.push(text);
+            } else if (text && (text.includes('RGV587_ERROR') || text.includes('FAIL_SYS_SESSION_EXPIRED'))) {
+              redirectedToLogin = true;
             }
           } catch {
             // ignore
@@ -927,37 +931,67 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
           })
           .catch(() => {});
 
-        // 若跳转到 login.taobao.com 且存在已登录快速确认按钮 (.has-login)，自动触发 SSO 跳转
-        if (page.url().includes('login.taobao.com')) {
-          const clickedQuickLogin = await page
-            .evaluate(() => {
-              const btn = document.querySelector(
-                '.has-login button, .has-login .fm-button, button.fm-button',
-              ) as HTMLButtonElement | null;
-              if (btn && (btn.textContent || '').includes('登录')) {
-                btn.click();
-                return true;
-              }
-              return false;
-            })
-            .catch(() => false);
+        let loginTicksWithoutQuickBtn = 0;
 
-          if (clickedQuickLogin) {
-            await page.waitForTimeout(2500);
+        for (let i = 0; i < 24; i++) {
+          await page.waitForTimeout(300);
+          if (mtopPayloads.length > 0) {
+            redirectedToLogin = false;
+            break;
+          }
+
+          const curUrl = page.url();
+          if (curUrl.includes('login.taobao.com') || curUrl.includes('login.m.taobao.com')) {
+            redirectedToLogin = true;
+            const loginState = await page
+              .evaluate(() => {
+                const btn = document.querySelector(
+                  '.has-login button, .has-login .fm-button, button.fm-button',
+                ) as HTMLButtonElement | null;
+                if (btn && (btn.textContent || '').includes('登录')) {
+                  btn.click();
+                  return 'clicked_has_login';
+                }
+                const hasHasLoginBox = Boolean(document.querySelector('.has-login'));
+                return hasHasLoginBox ? 'waiting_has_login' : 'need_manual_login';
+              })
+              .catch(() => 'navigating');
+
+            if (loginState === 'need_manual_login') {
+              loginTicksWithoutQuickBtn++;
+              if (loginTicksWithoutQuickBtn >= 6) {
+                break;
+              }
+            }
+            continue;
+          }
+
+          // 检查是否仍在 5KB rgv587_flag:sm 跳转壳子页 (#a-link)，若是则继续等待其自动跳转
+          const pageStage = await page
+            .evaluate(() => {
+              const isJumpShell =
+                Boolean(document.getElementById('a-link')) &&
+                !document.querySelector('h1, [class*="mainTitle"], [class*="ItemTitle"], [class*="Price--"]');
+              if (isJumpShell) return 'jump_shell';
+              const hasRenderedDetail = Boolean(
+                document.querySelector(
+                  'h1, [class*="mainTitle"], [class*="ItemTitle"], [class*="ItemHeader--mainTitle"], [class*="Price--"], .tb-rmb-num, .tm-price',
+                ),
+              );
+              return hasRenderedDetail ? 'detail_ready' : 'loading';
+            })
+            .catch(() => 'loading');
+
+          if (pageStage === 'detail_ready') {
+            redirectedToLogin = false;
+            await page.waitForTimeout(450);
+            break;
           }
         }
 
-        for (let i = 0; i < 12; i++) {
-          await page.waitForTimeout(250);
-          if (mtopPayloads.length > 0) break;
-          if (page.url().includes('login.taobao.com') && i >= 3) break;
-        }
-
-        if (!page.url().includes('login.taobao.com') || mtopPayloads.length > 0) {
-          redirectedToLogin = false;
+        if ((!page.url().includes('login.taobao.com') && !redirectedToLogin) || mtopPayloads.length > 0) {
           break;
         }
-        redirectedToLogin = true;
       }
 
       // 1. 解析捕获到的 MTOP 商品详情 JSON
@@ -980,134 +1014,146 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
       }
 
       // 2. 从渲染后的 DOM 提取标题、主图、店铺名、已选 SKU 规格与价格（兼容 2025/2026 淘宝天猫新版 SSR/ICE 详情页）
-      if (!page.url().includes('login.taobao.com')) {
-        const domInfo = await page.evaluate(() => {
-          const clean = (s?: string | null) => (s || '').replace(/\s+/g, ' ').trim();
-          const h1Text = clean(
-            document.querySelector(
-              'h1, [class*="mainTitle"], [class*="ItemTitle--mainTitle"], [class*="ItemHeader--mainTitle"]',
-            )?.textContent,
-          );
-          const docTitle = clean(document.title)
-            .replace(/-tmall\.com天猫.*$/i, '')
-            .replace(/-淘宝网.*$/i, '')
-            .trim();
+      if (!page.url().includes('login.taobao.com') && !page.url().includes('login.m.taobao.com')) {
+        const domInfo = await page
+          .evaluate(() => {
+            const clean = (s?: string | null) => (s || '').replace(/\s+/g, ' ').trim();
+            const isJumpShell = Boolean(document.getElementById('a-link')) && !document.title;
+            if (isJumpShell) {
+              return null;
+            }
 
-          const shopText = clean(
-            document.querySelector(
-              '[class*="shopName"], [class*="ShopName"], [class*="ShopHeader--title"], [class*="shop-name"]',
-            )?.textContent,
-          );
+            const h1Text = clean(
+              document.querySelector(
+                'h1, [class*="mainTitle"], [class*="ItemTitle--mainTitle"], [class*="ItemHeader--mainTitle"]',
+              )?.textContent,
+            );
+            const docTitle = clean(document.title)
+              .replace(/-tmall\.com天猫.*$/i, '')
+              .replace(/-淘宝网.*$/i, '')
+              .trim();
 
-          const selectedSpecs = Array.from(
-            document.querySelectorAll(
-              '[class*="skuItem"][class*="isSelected"], [class*="valueItem"][class*="isSelected"], [class*="skuValueName"], [aria-checked="true"]',
-            ),
-          )
-            .map(el => clean(el.textContent))
-            .filter(s => s && s.length <= 40);
-
-          const galleryImgs = Array.from(
-            document.querySelectorAll(
-              '[class*="mainPic"] img, [class*="PicGallery"] img, [class*=" thumbnails"] img, img',
-            ),
-          )
-            .map(img => (img as HTMLImageElement).src || img.getAttribute('data-src') || '')
-            .filter(
-              src =>
-                src &&
-                (src.includes('alicdn.com/imgextra') ||
-                  src.includes('alicdn.com/bao/uploaded') ||
-                  src.includes('gw.alicdn.com/bao/uploaded')) &&
-                !src.includes('tps-48-48') &&
-                !src.includes('tps-236-298') &&
-                !src.includes('avatar'),
+            const shopText = clean(
+              document.querySelector(
+                '[class*="shopName"], [class*="ShopName"], [class*="ShopHeader--title"], [class*="shop-name"]',
+              )?.textContent,
             );
 
-          const priceContainer =
-            (document.querySelector('[class*="Price--"], [class*="priceWrap"], [class*="summary-price"]') as HTMLElement | null) ||
-            document.body;
-          const priceTexts = Array.from(
-            document.querySelectorAll(
-              '[class*="highlightPrice"] [class*="priceText"], [class*="subPrice"] [class*="priceText"], [class*="extraPrice"] [class*="priceText"], [class*="Price--priceText"], .tb-rmb-num, .tm-price',
-            ),
-          )
-            .map(el => clean(el.textContent))
-            .filter(Boolean);
+            const selectedSpecs = Array.from(
+              document.querySelectorAll(
+                '[class*="skuItem"][class*="isSelected"], [class*="valueItem"][class*="isSelected"], [class*="skuValueName"], [aria-checked="true"]',
+              ),
+            )
+              .map(el => clean(el.textContent))
+              .filter(s => s && s.length <= 40);
 
-          const promoTexts = Array.from(
-            document.querySelectorAll(
-              '[class*="coupon"], [class*="Coupon"], [class*="promo"], [class*="Promo"], [class*="subsidy"], [class*="SubPrice"]',
-            ),
-          )
-            .map(el => clean(el.textContent))
-            .filter(s => s && s.length <= 80)
-            .slice(0, 15);
+            const galleryImgs = Array.from(
+              document.querySelectorAll(
+                '[class*="mainPic"] img, [class*="PicGallery"] img, [class*="thumbnails"] img, img',
+              ),
+            )
+              .map(img => (img as HTMLImageElement).src || img.getAttribute('data-src') || '')
+              .filter(
+                src =>
+                  src &&
+                  (src.includes('alicdn.com/imgextra') ||
+                    src.includes('alicdn.com/bao/uploaded') ||
+                    src.includes('gw.alicdn.com/bao/uploaded')) &&
+                  !src.includes('tps-48-48') &&
+                  !src.includes('tps-236-298') &&
+                  !src.includes('avatar'),
+              );
 
-          const bodySnippet = clean((priceContainer || document.body).innerText).slice(0, 3500);
+            const priceContainer =
+              (document.querySelector(
+                '[class*="Price--"], [class*="priceWrap"], [class*="summary-price"]',
+              ) as HTMLElement | null) || document.body;
+            const priceTexts = Array.from(
+              document.querySelectorAll(
+                '[class*="highlightPrice"] [class*="priceText"], [class*="subPrice"] [class*="priceText"], [class*="extraPrice"] [class*="priceText"], [class*="Price--priceText"], [class*="priceText"], .tb-rmb-num, .tm-price',
+              ),
+            )
+              .map(el => clean(el.textContent))
+              .filter(Boolean);
 
-          return {
-            title: h1Text || docTitle,
-            shopName: shopText,
-            spec: Array.from(new Set(selectedSpecs)).join(' · '),
-            imageUrl: galleryImgs[0] || '',
-            priceTexts,
-            promoTexts,
-            bodySnippet,
-          };
-        });
+            const promoTexts = Array.from(
+              document.querySelectorAll(
+                '[class*="coupon"], [class*="Coupon"], [class*="promo"], [class*="Promo"], [class*="subsidy"], [class*="SubPrice"]',
+              ),
+            )
+              .map(el => clean(el.textContent))
+              .filter(s => s && s.length <= 80)
+              .slice(0, 15);
 
-        if (domInfo.title && !/登录|验证|安全|商品详情页/.test(domInfo.title)) {
-          title = domInfo.title;
-        }
-        if (domInfo.shopName && !shopName) {
-          shopName = domInfo.shopName;
-        }
-        if (domInfo.spec && !spec) {
-          spec = domInfo.spec;
-        }
-        if (domInfo.imageUrl && !imageUrl) {
-          imageUrl = normalizeImageUrl(domInfo.imageUrl);
-        }
+            const bodySnippet = clean((priceContainer || document.body).innerText).slice(0, 3500);
 
-        const numericPrices = domInfo.priceTexts
-          .map(t => parseCleanNumericPrice(t))
-          .filter(n => n > 0);
+            return {
+              title: h1Text || docTitle,
+              shopName: shopText,
+              spec: Array.from(new Set(selectedSpecs)).join(' · '),
+              imageUrl: galleryImgs[0] || '',
+              priceTexts,
+              promoTexts,
+              bodySnippet,
+            };
+          })
+          .catch(() => null);
 
-        if (numericPrices.length >= 2 && !pagePrice) {
-          pagePrice = Math.max(...numericPrices.slice(0, 3));
-          finalPrice = Math.min(...numericPrices.slice(0, 3));
-        } else if (numericPrices.length === 1 && !pagePrice) {
-          pagePrice = numericPrices[0];
-          finalPrice = numericPrices[0];
-        }
+        if (domInfo) {
+          if (domInfo.title && !/登录|验证|安全|商品详情页/.test(domInfo.title)) {
+            title = domInfo.title;
+          }
+          if (domInfo.shopName && !shopName) {
+            shopName = domInfo.shopName;
+          }
+          if (domInfo.spec && !spec) {
+            spec = domInfo.spec;
+          }
+          if (domInfo.imageUrl && !imageUrl) {
+            imageUrl = normalizeImageUrl(domInfo.imageUrl);
+          }
 
-        // 从价格区文本兜底提取 "券后 ¥xxx 优惠前 ¥yyy" 或 "政府补贴价 ¥xxx"
-        if (!pagePrice && domInfo.bodySnippet) {
-          const pairMatch = domInfo.bodySnippet.match(
-            /(?:券后|到手价|补贴价|折后)\s*¥?\s*(\d+(?:\.\d{1,2})?)[^¥\d]{0,20}(?:优惠前|原价|日常价|价格|¥)\s*¥?\s*(\d+(?:\.\d{1,2})?)/,
-          );
-          if (pairMatch?.[1] && pairMatch?.[2]) {
-            const p1 = parseCleanNumericPrice(pairMatch[1]);
-            const p2 = parseCleanNumericPrice(pairMatch[2]);
-            if (p1 > 0 && p2 > 0) {
-              finalPrice = Math.min(p1, p2);
-              pagePrice = Math.max(p1, p2);
-            }
-          } else {
-            const singleMatch = domInfo.bodySnippet.match(/¥\s*(\d+(?:\.\d{1,2})?)/);
-            if (singleMatch?.[1]) {
-              pagePrice = parseCleanNumericPrice(singleMatch[1]);
-              finalPrice = pagePrice;
+          const numericPrices = domInfo.priceTexts
+            .map(t => parseCleanNumericPrice(t))
+            .filter(n => n > 0);
+
+          if (numericPrices.length >= 2 && !pagePrice) {
+            pagePrice = Math.max(...numericPrices.slice(0, 3));
+            finalPrice = Math.min(...numericPrices.slice(0, 3));
+          } else if (numericPrices.length === 1 && !pagePrice) {
+            pagePrice = numericPrices[0];
+            finalPrice = numericPrices[0];
+          }
+
+          // 从价格区文本兜底提取 "券后 ¥/￥xxx 优惠前 ¥/￥yyy" 或 "政府补贴价 ¥/￥xxx"
+          if (!pagePrice && domInfo.bodySnippet) {
+            const pairMatch = domInfo.bodySnippet.match(
+              /(?:券后|到手价|补贴价|折后)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)[^¥￥\d]{0,20}(?:优惠前|原价|日常价|价格|[¥￥])\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/,
+            );
+            if (pairMatch?.[1] && pairMatch?.[2]) {
+              const p1 = parseCleanNumericPrice(pairMatch[1]);
+              const p2 = parseCleanNumericPrice(pairMatch[2]);
+              if (p1 > 0 && p2 > 0) {
+                finalPrice = Math.min(p1, p2);
+                pagePrice = Math.max(p1, p2);
+              }
+            } else {
+              const singleMatch = domInfo.bodySnippet.match(/[¥￥]\s*(\d+(?:\.\d{1,2})?)/);
+              if (singleMatch?.[1]) {
+                pagePrice = parseCleanNumericPrice(singleMatch[1]);
+                finalPrice = pagePrice;
+              }
             }
           }
-        }
 
-        combinedRawText += `\n${domInfo.promoTexts.join(' ')}\n${domInfo.bodySnippet}`;
+          combinedRawText += `\n${domInfo.promoTexts.join(' ')}\n${domInfo.bodySnippet}`;
 
-        if (/下架|已售罄|无货|此商品已下架/.test(domInfo.bodySnippet)) {
-          inStock = false;
-          stockText = '无货 / 下架';
+          if (/下架|已售罄|无货|此商品已下架/.test(domInfo.bodySnippet)) {
+            inStock = false;
+            stockText = '无货 / 下架';
+          }
+        } else {
+          redirectedToLogin = true;
         }
       }
     } finally {

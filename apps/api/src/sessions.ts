@@ -83,7 +83,8 @@ const JD_QR_CHECK_URL = 'https://qr.m.jd.com/check';
 const JD_QR_VALIDATE_URL = 'https://passport.jd.com/uc/qrCodeTicketValidation';
 const JD_LOGIN_VERIFY_URL = 'https://passport.jd.com/loginservice.aspx';
 
-const TB_LOGIN_PAGE_URL = 'https://login.taobao.com/havanaone/login/login.htm?bizName=taobao&sub=true';
+const TB_LOGIN_PAGE_URL =
+  'https://login.taobao.com/havanaone/login/login.htm?bizName=taobao&redirectURL=https%3A%2F%2Fwww.taobao.com%2F';
 const TB_QR_GENERATE_URL = 'https://login.taobao.com/havanaone/loginLegacy/qrCode/generate.do';
 const TB_QR_QUERY_URL = 'https://login.taobao.com/havanaone/loginLegacy/qrCode/query.do';
 const TB_SMS_SEND_URL = 'https://login.taobao.com/havanaone/loginLegacy/sms/sendSms.do';
@@ -1447,6 +1448,7 @@ export class SessionsController implements OnModuleInit {
                 titleMsg?: string;
                 redirectUrl?: string;
                 iframeRedirectUrl?: string;
+                asyncUrls?: string[];
               };
             };
           };
@@ -1454,8 +1456,9 @@ export class SessionsController implements OnModuleInit {
           if (d?.qrCodeStatus) {
             activeTaobaoQrSession.lastStatus = d.qrCodeStatus;
             activeTaobaoQrSession.lastMessage = d.titleMsg || '';
-            if (d.redirectUrl || d.iframeRedirectUrl) {
-              activeTaobaoQrSession.redirectUrl = d.redirectUrl || d.iframeRedirectUrl;
+            const targetRedirect = d.redirectUrl || d.iframeRedirectUrl || d.asyncUrls?.[0];
+            if (targetRedirect) {
+              activeTaobaoQrSession.redirectUrl = targetRedirect;
             }
           }
         } catch {
@@ -1467,7 +1470,7 @@ export class SessionsController implements OnModuleInit {
     page.removeAllListeners('response');
     page.on('response', onResponse);
 
-    await page.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'networkidle', timeout: 25000 });
+    await page.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
     // 如果当前页面处于快速确认登录视图 (hasLogin)，点击“使用其他账号登录”切换到二维码视图
     await page
@@ -1481,19 +1484,21 @@ export class SessionsController implements OnModuleInit {
 
     const canvasLoc = page.locator('canvas').first();
     await canvasLoc.waitFor({ state: 'visible', timeout: 10000 });
-    await page.waitForTimeout(350);
+    await page.waitForTimeout(250);
 
-    const meta = await page.evaluate(async () => {
-      const w = window as unknown as {
-        viewData?: { loginFormData?: { _csrf?: string } };
-      };
-      const csrf = w.viewData?.loginFormData?._csrf || '';
-      return { csrf };
-    });
+    const meta = await page
+      .evaluate(async () => {
+        const w = window as unknown as {
+          viewData?: { loginFormData?: { _csrf?: string } };
+        };
+        const csrf = w.viewData?.loginFormData?._csrf || '';
+        return { csrf };
+      })
+      .catch(() => ({ csrf: '' }));
 
     // 等待页面自身发出的 generate.do 响应返回（不要二次主动请求 generate.do，以免服务端 ck 与画布上的二维码不一致）
     for (let waitAttempt = 0; waitAttempt < 12 && !capturedGen; waitAttempt++) {
-      await page.waitForTimeout(200);
+      await page.waitForTimeout(150);
     }
 
     const pngBuffer = await canvasLoc.screenshot({ type: 'png' });
@@ -1725,11 +1730,11 @@ export class SessionsController implements OnModuleInit {
     const context = await getTaobaoHeadlessContext();
     if (!headlessTbPage || headlessTbPage.isClosed()) {
       headlessTbPage = await context.newPage();
-      await headlessTbPage.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'networkidle', timeout: 25000 });
+      await headlessTbPage.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
     }
     const page = headlessTbPage;
     if (!page.url().includes('login.taobao.com')) {
-      await page.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'networkidle', timeout: 25000 });
+      await page.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
     }
 
     // 切换到短信验证码登录 Tab
