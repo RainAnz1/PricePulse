@@ -1,0 +1,29 @@
+MIT License
+
+Copyright (c) 2026 RainAnz1 (PricePulse Contributors)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+### 免责声明与合规使用授权说明 (Disclaimer & Acceptable Use Policy)
+
+1. 本项目 (`PricePulse`) 为开源个人工具与技术学习项目，旨在帮助个人消费者管理自用购物心愿单、观察商品价格波动及接收个人飞书通知。
+2. 使用者应严格遵守目标电商平台（京东、淘宝、天猫等）的《用户服务协议》及 `robots.txt` 规范，合理设置轮询间隔，严禁将本项目用于恶意高频抓取、商业倒卖数据或任何破坏目标平台正常运营的行为。
+3. 使用者在本地或私有服务器、私有云、NAS 上运行本项目时，扫码登录产生的 Cookie 与会话凭证仅保存在使用者自有设备的 `.local-data/` 目录下，本项目不包含任何第三方云端上传或遥测逻辑。因使用者不当公开自身服务器端口或泄露个人 Cookie 造成的风险，由使用者自行承担。

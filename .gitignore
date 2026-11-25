@@ -1,0 +1,78 @@
+# =============================================================================
+# Price_drop_one — Open Source Security & Build Ignore Rules
+# 严禁将任何个人 Cookie、登录会话、飞书 Webhook 密钥或本地抓取缓存提交至仓库
+# =============================================================================
+
+# 1. 本地运行数据、私人登录态 Cookie、浏览器持久化 Profile 与 Webhook 配置（高敏核心）
+.local-data/
+**/PriceDrop/
+data/
+cookies/
+sessions/
+browser-profiles/
+profiles/
+storage/
+auth/
+*.cookie
+*.cookies
+*cookie*.json
+*session*.json
+*feishu*.json
+*webhook*.json
+*token*.json
+*secret*.json
+jd.json
+taobao.json
+tmall.json
+feishu.json
+products.json
+
+# 2. 环境变量与密钥文件
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+
+# 3. 数据库与本地缓存
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.dump
+.cache/
+tmp/
+temp/
+
+# 4. Node.js 依赖与前后端构建产物
+node_modules/
+dist/
+build/
+out/
+.next/
+.vite/
+.turbo/
+*.tsbuildinfo
+
+# 5. Playwright / 浏览器自动化截图与录制缓存
+test-results/
+playwright-report/
+playwright/.cache/
+screenshots/
+traces/
+
+# 6. 操作系统、编辑器与日志文件
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

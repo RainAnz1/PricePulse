@@ -1,0 +1,13 @@
+services:
+  price-pulse:
+    build: .
+    container_name: price-pulse
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+      - "3001:3001"
+    volumes:
+      - ./local-data:/app/.local-data
+    environment:
+      - NODE_ENV=production
+      - TZ=Asia/Shanghai
