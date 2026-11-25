@@ -1,0 +1,57 @@
+name: Build NAS release
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container:
+      image: mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build application
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          node apps/api/test-product-url.cjs
+          npm prune --omit=dev --no-audit --no-fund
+
+      - name: Package NAS release
+        run: |
+          release=$(mktemp -d "$RUNNER_TEMP/price-pulse.XXXXXXXX")
+          mkdir -p "$release/runtime/apps" "$release/web" nas-release
+
+          cp package.json "$release/runtime/"
+          cp -a node_modules "$release/runtime/"
+          for workspace in api web; do
+            mkdir "$release/runtime/apps/$workspace"
+            cp "apps/$workspace/package.json" "$release/runtime/apps/$workspace/"
+            if [ -d "apps/$workspace/node_modules" ]; then
+              cp -a "apps/$workspace/node_modules" "$release/runtime/apps/$workspace/"
+            fi
+          done
+          cp -a apps/api/dist "$release/runtime/apps/api/"
+          cp -a apps/web/dist/. "$release/web/"
+          printf '%s\n' "$GITHUB_SHA" > "$release/release.commit"
+
+          cd nas-release
+          tar -czf price-pulse-linux-amd64.tar.gz -C "$release" runtime web release.commit
+          sha256sum price-pulse-linux-amd64.tar.gz > price-pulse-linux-amd64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: price-pulse-nas-linux-amd64
+          path: nas-release/
+          if-no-files-found: error
+          compression-level: 0
