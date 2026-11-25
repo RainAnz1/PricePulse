@@ -8,6 +8,8 @@ assert.equal(taobao.skuId, '6165077234674');
 assert.equal(taobao.canonicalUrl, 'https://detail.tmall.com/item.htm?id=1005933865145&skuId=6165077234674');
 assert.throws(() => parseProductUrl('https://detail.tmall.com/item.htm?id=0'));
 assert.throws(() => parseProductUrl('https://item.jd.com.evil.test/100413060348.html'));
-assert.throws(() => parseProductUrl('https://detail.tmall.com/item.htm?id=123&skuId=abc'));
+const invalidSku = parseProductUrl('https://detail.tmall.com/item.htm?id=123&skuId=abc');
+assert.equal(invalidSku.skuId, null);
+assert.equal(invalidSku.canonicalUrl, 'https://detail.tmall.com/item.htm?id=123');
 console.log('商品链接和规格识别检查通过');
 
