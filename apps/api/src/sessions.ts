@@ -1880,7 +1880,7 @@ export class SessionsController implements OnModuleInit {
   @Get('taobao/status')
   async getTaobaoStatus() {
     const saved = loadPersistedTaobaoSession();
-    const hasCoreAuthCookie = Boolean(saved && (saved.cookies.cookie2 || saved.cookies.uc3 || saved.cookies.sgcookie));
+    const hasCoreAuthCookie = Boolean(saved && (saved.cookies.uc3 || saved.cookies.sgcookie || saved.cookies.cookie17));
     if (saved && hasCoreAuthCookie && Object.keys(saved.cookies).length > 0) {
       return {
         state: 'logged_in',
