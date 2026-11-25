@@ -83,8 +83,7 @@ const JD_QR_CHECK_URL = 'https://qr.m.jd.com/check';
 const JD_QR_VALIDATE_URL = 'https://passport.jd.com/uc/qrCodeTicketValidation';
 const JD_LOGIN_VERIFY_URL = 'https://passport.jd.com/loginservice.aspx';
 
-const TB_LOGIN_PAGE_URL =
-  'https://login.taobao.com/havanaone/login/login.htm?bizName=taobao&redirectURL=https%3A%2F%2Fwww.taobao.com%2F';
+const TB_LOGIN_PAGE_URL = 'https://login.taobao.com/havanaone/login/login.htm?bizName=taobao&sub=true';
 const TB_QR_GENERATE_URL = 'https://login.taobao.com/havanaone/loginLegacy/qrCode/generate.do';
 const TB_QR_QUERY_URL = 'https://login.taobao.com/havanaone/loginLegacy/qrCode/query.do';
 const TB_SMS_SEND_URL = 'https://login.taobao.com/havanaone/loginLegacy/sms/sendSms.do';
@@ -1410,6 +1409,8 @@ export class SessionsController implements OnModuleInit {
     };
   }
 
+  private pendingTaobaoQrStart: Promise<unknown> | null = null;
+
   /**
    * 7. 获取淘宝网页内扫码登录二维码
    * 底层协议：GET https://login.taobao.com/havanaone/loginLegacy/qrCode/generate.do?bizEntrance=taobao_pc&bizName=taobao
@@ -1418,6 +1419,19 @@ export class SessionsController implements OnModuleInit {
   @Post('taobao/qrcode/start')
   async startTaobaoQrCode(@Req() req: Request) {
     validateOrigin(req);
+    if (this.pendingTaobaoQrStart) {
+      return this.pendingTaobaoQrStart;
+    }
+    const task = this.executeStartTaobaoQrCode();
+    this.pendingTaobaoQrStart = task;
+    try {
+      return await task;
+    } finally {
+      this.pendingTaobaoQrStart = null;
+    }
+  }
+
+  private async executeStartTaobaoQrCode() {
     const context = await getTaobaoHeadlessContext();
     if (!headlessTbPage || headlessTbPage.isClosed()) {
       headlessTbPage = await context.newPage();
@@ -1472,18 +1486,30 @@ export class SessionsController implements OnModuleInit {
 
     await page.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-    // 如果当前页面处于快速确认登录视图 (hasLogin)，点击“使用其他账号登录”切换到二维码视图
-    await page
-      .evaluate(() => {
-        const otherLink = Array.from(document.querySelectorAll('a')).find(a =>
-          (a.textContent || '').includes('使用其他账号登录'),
-        );
-        if (otherLink) otherLink.click();
-      })
-      .catch(() => {});
-
     const canvasLoc = page.locator('canvas').first();
-    await canvasLoc.waitFor({ state: 'visible', timeout: 10000 });
+    // 循环检测：若 React 渲染了快速确认视图 (hasLogin) 或密码视图，自动点击“使用其他账号登录”或“扫码登录”切换出二维码画布
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const visible = await canvasLoc.isVisible().catch(() => false);
+      if (visible) break;
+      await page
+        .evaluate(() => {
+          const candidates = Array.from(document.querySelectorAll('a, div, span, i'));
+          const otherLink = candidates.find(el => {
+            const txt = (el.textContent || '').trim();
+            return txt === '使用其他账号登录' || txt === '其他账号登录' || txt === '扫码登录';
+          }) as HTMLElement | undefined;
+          if (otherLink) {
+            otherLink.click();
+            return;
+          }
+          const qrIcon = document.querySelector('.icon-qrcode, .J_Quick2Static') as HTMLElement | null;
+          if (qrIcon) qrIcon.click();
+        })
+        .catch(() => {});
+      await page.waitForTimeout(250);
+    }
+
+    await canvasLoc.waitFor({ state: 'visible', timeout: 8000 });
     await page.waitForTimeout(250);
 
     const meta = await page
@@ -1686,15 +1712,27 @@ export class SessionsController implements OnModuleInit {
           };
         case 'CONFIRMED': {
           if (headlessTbPage && !headlessTbPage.isClosed()) {
-            await headlessTbPage.waitForTimeout(1000).catch(() => {});
+            await headlessTbPage.waitForTimeout(800).catch(() => {});
             if (activeTaobaoQrSession.redirectUrl) {
               await headlessTbPage
                 .goto(activeTaobaoQrSession.redirectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 })
                 .catch(() => {});
             }
             await headlessTbPage
-              .goto('https://www.taobao.com/', { waitUntil: 'domcontentloaded', timeout: 12000 })
+              .goto('https://login.taobao.com/member/login.jhtml?redirectURL=https%3A%2F%2Fwww.taobao.com%2F', {
+                waitUntil: 'domcontentloaded',
+                timeout: 15000,
+              })
               .catch(() => {});
+            await headlessTbPage
+              .evaluate(() => {
+                const btn = document.querySelector(
+                  '.has-login button, .has-login .fm-button, button.fm-button',
+                ) as HTMLButtonElement | null;
+                if (btn && (btn.textContent || '').includes('登录')) btn.click();
+              })
+              .catch(() => {});
+            await headlessTbPage.waitForTimeout(1500).catch(() => {});
           }
           const saved = await syncTaobaoCookiesFromHeadlessContext({}, 'qrcode');
         activeTaobaoQrSession = null;
