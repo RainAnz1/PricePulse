@@ -1,11 +1,12 @@
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const { mkdtempSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { test } = require('node:test');
 const { readJdDisplayedPrice, resolveJdPrice } = require('./dist/jd-price');
 const { saveFeishuConfig } = require('./dist/feishu');
-const { scrapeAndUpsertProduct } = require('./dist/products');
+const { ProductsController, scrapeAndUpsertProduct } = require('./dist/products');
 const sessionModule = require('./dist/sessions');
 const {
   SessionsController,
@@ -94,6 +95,7 @@ test('Taobao product verification is reported separately from login expiry', asy
   const item = 'https://item.taobao.com/item.htm?id=123456&skuId=4321';
   const page = {
     on() {},
+    off() {},
     async route() {},
     async goto() {},
     async waitForTimeout() {},
@@ -112,6 +114,87 @@ test('Taobao product verification is reported separately from login expiry', asy
   });
   assert.equal(page.evaluate.mock.callCount(), 1);
   assert.equal(page.close.mock.callCount(), 1);
+});
+
+test('manual Taobao verification resumes the same page and is available only to its LAN owner', async t => {
+  const previousRoot = process.env.LOCALAPPDATA;
+  const previousNetwork = process.env.PRICEPULSE_VERIFICATION_LAN_CIDR;
+  const root = mkdtempSync(join(tmpdir(), 'pricepulse-verification-'));
+  process.env.LOCALAPPDATA = root;
+  process.env.PRICEPULSE_VERIFICATION_LAN_CIDR = '192.168.0.0/24';
+  t.after(() => {
+    if (previousRoot === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousRoot;
+    if (previousNetwork === undefined) delete process.env.PRICEPULSE_VERIFICATION_LAN_CIDR;
+    else process.env.PRICEPULSE_VERIFICATION_LAN_CIDR = previousNetwork;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const item = 'https://item.taobao.com/item.htm?id=123456&skuId=4321';
+  const request = (address, token, site = 'same-origin') => ({
+    socket: { remoteAddress: address },
+    get: name => ({
+      'x-pricepulse-verification-token': token,
+      'x-forwarded-for': '192.168.0.10',
+      'sec-fetch-site': site,
+    })[name],
+  });
+  const owner = request('192.168.0.10', 'a'.repeat(32));
+  const otherBrowser = request('192.168.0.10', 'b'.repeat(32));
+  const publicProxy = request('172.17.0.1', 'a'.repeat(32));
+  const crossSite = request('192.168.0.10', 'a'.repeat(32), 'cross-site');
+  let verified = false;
+  let closed = false;
+  const page = Object.assign(new EventEmitter(), {
+    url: () => item,
+    title: async () => verified ? '测试商品' : 'CAPTCHA Verification',
+    isClosed: () => closed,
+    async route() {},
+    goto: t.mock.fn(async () => {}),
+    async waitForTimeout() {},
+    viewportSize: () => ({ width: 1280, height: 800 }),
+    screenshot: async () => Buffer.from('fixture'),
+    evaluate: async task => {
+      if (String(task).includes('priceReady')) {
+        return { title: verified ? '测试商品' : 'CAPTCHA Verification', priceReady: verified };
+      }
+      return { title: '测试商品', priceTexts: ['123.00'], promoTexts: [], bodySnippet: '' };
+    },
+    close: t.mock.fn(async () => {
+      closed = true;
+      page.emit('close');
+    }),
+  });
+  const context = { newPage: t.mock.fn(async () => page) };
+  page.context = () => context;
+  t.mock.method(sessionModule, 'getTaobaoHeadlessContext', async () => context);
+
+  const controller = new ProductsController();
+  await assert.rejects(controller.parse(item, owner), error => error.getResponse().verificationAvailable === true);
+  assert.equal(page.close.mock.callCount(), 0);
+  assert.match((await controller.getVerificationFrame(owner)).screenshot, /^data:image\/jpeg;base64,/);
+  await assert.rejects(controller.getVerificationFrame(otherBrowser), { status: 410 });
+  await assert.rejects(controller.getVerificationFrame(publicProxy), { status: 403 });
+  await assert.rejects(controller.getVerificationFrame(crossSite), { status: 403 });
+  await assert.rejects(controller.confirmVerification(owner), { status: 400 });
+  assert.equal(page.close.mock.callCount(), 0);
+
+  verified = true;
+  assert.deepEqual(await controller.getVerificationFrame(owner), { state: 'ready' });
+  const product = await controller.confirmVerification(owner);
+  assert.equal(product.skuId, '4321');
+  assert.equal(controller.list().products[0].finalPrice, 123);
+  assert.equal(context.newPage.mock.callCount(), 1);
+  assert.equal(page.goto.mock.callCount(), 1);
+  assert.equal(page.close.mock.callCount(), 1);
+  await assert.rejects(controller.getVerificationFrame(owner), { status: 410 });
+
+  verified = false;
+  closed = false;
+  await assert.rejects(controller.parse(item, otherBrowser), error => error.getResponse().verificationAvailable === true);
+  assert.deepEqual(await controller.cancelVerification(otherBrowser), { ok: true });
+  assert.equal(page.close.mock.callCount(), 2);
+  await assert.rejects(controller.getVerificationFrame(otherBrowser), { status: 410 });
 });
 
 test('JD frequency controls are reported separately from login', async t => {

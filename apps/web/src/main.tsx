@@ -695,6 +695,16 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
 
 type RemotePoint = { x: number; y: number };
 
+const verificationBase = '/api/products/verification';
+
+function browserInteractionId() {
+  return Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16).padStart(8, '0')).join('');
+}
+
+function verificationHeaders(token: string) {
+  return { 'X-PricePulse-Verification-Token': token };
+}
+
 interface RemotePointerInteraction {
   id: string;
   browserPointerId: number;
@@ -710,11 +720,13 @@ function RemoteBrowserViewport({
   initialFrame,
   onLoggedIn,
   onMessage,
+  verificationToken,
 }: {
   platform: 'jd' | 'taobao';
   initialFrame: RemoteBrowserFrame | null;
   onLoggedIn: (session: PlatformSessionInfo) => void;
   onMessage: (msg: string) => void;
+  verificationToken?: string;
 }) {
   const [frame, setFrame] = useState<RemoteBrowserFrame | null>(initialFrame);
   const [loading, setLoading] = useState(false);
@@ -724,6 +736,7 @@ function RemoteBrowserViewport({
   const actionBusyRef = useRef(false);
   const frameBusyRef = useRef(false);
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const base = verificationToken ? verificationBase : `/api/sessions/${platform}/remote`;
 
   const vw = frame?.viewport?.width || 1280;
   const vh = frame?.viewport?.height || 800;
@@ -747,12 +760,20 @@ function RemoteBrowserViewport({
     setLoading(true);
     actionBusyRef.current = true;
     try {
-      const res = await fetch(`/api/sessions/${platform}/remote/start`, {
+      const res = await fetch(verificationToken ? `${base}/frame` : `${base}/start`, verificationToken ? {
+        headers: verificationHeaders(verificationToken),
+        signal: AbortSignal.timeout(12000),
+      } : {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keepCurrent: !resetToLogin }),
       });
       const data = await readFrame(res);
+      if (data.state === 'ready') {
+        setFrame(null);
+        setFrameError('已返回商品页，请点击「确定」继续采集');
+        return;
+      }
       if (data.state === 'logged_in') {
         onLoggedIn(data);
         return;
@@ -782,10 +803,16 @@ function RemoteBrowserViewport({
       lastPoll = Date.now();
       frameBusyRef.current = true;
       try {
-        const res = await fetch(`/api/sessions/${platform}/remote/frame`, {
+        const res = await fetch(`${base}/frame`, {
+          headers: verificationToken ? verificationHeaders(verificationToken) : undefined,
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(12000)]),
         });
         const data = await readFrame(res);
+        if (data.state === 'ready' && !controller.signal.aborted) {
+          setFrame(null);
+          setFrameError('已返回商品页，请点击「确定」继续采集');
+          return;
+        }
         if (data.state === 'logged_in') {
           onLoggedIn(data);
           return;
@@ -812,7 +839,7 @@ function RemoteBrowserViewport({
         void flushPointer(pointer);
       }
     };
-  }, [platform]);
+  }, [platform, verificationToken]);
 
   async function sendRemoteAction(payload: Record<string, unknown>) {
     if (pointerRef.current || actionBusyRef.current) return;
@@ -852,9 +879,12 @@ function RemoteBrowserViewport({
   }
 
   async function sendPointer(id: string, type: 'down' | 'move' | 'up' | 'cancel', point?: RemotePoint) {
-    const response = await fetch(`/api/sessions/${platform}/remote/pointer`, {
+    const response = await fetch(`${base}/pointer`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(verificationToken ? verificationHeaders(verificationToken) : {}),
+      },
       body: JSON.stringify({ id, type, ...point }),
       keepalive: type === 'cancel' || type === 'up',
       signal: AbortSignal.timeout(5000),
@@ -895,7 +925,7 @@ function RemoteBrowserViewport({
     if (!frame?.screenshot || actionBusyRef.current || pointerRef.current || !e.isPrimary || e.button !== 0) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
-    const id = Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16).padStart(8, '0')).join('');
+    const id = browserInteractionId();
     const pointer: RemotePointerInteraction = {
       id,
       browserPointerId: e.pointerId,
@@ -936,7 +966,7 @@ function RemoteBrowserViewport({
           <span className="remote-live-dot" />
           <span className="sf-mono">{frame?.url || (frameError && !loading ? '实时画面暂不可用' : '正在连接云端浏览器画面…')}</span>
         </div>
-        <div className="remote-tool-btns">
+        {!verificationToken && <div className="remote-tool-btns">
           <button
             type="button"
             className="apple-btn-secondary sm"
@@ -969,10 +999,10 @@ function RemoteBrowserViewport({
           >
             重置回登录页
           </button>
-        </div>
+        </div>}
       </div>
 
-      <form className="remote-input-bar" onSubmit={handleSendText}>
+      {!verificationToken && <form className="remote-input-bar" onSubmit={handleSendText}>
         <input
           type="text"
           value={textInput}
@@ -998,12 +1028,12 @@ function RemoteBrowserViewport({
         >
           回车
         </button>
-      </form>
+      </form>}
 
       <div className="remote-tip-row">
-        <span>
+        {verificationToken ? <span>在画面中按淘宝提示完成验证，再点击「确定」。</span> : <span>
           操作说明：直接在下方画面中<strong>点击按钮/点选验证码</strong>，或<strong>按住鼠标左键拖动滑块</strong>即可过人机验证；验证/登录完成后系统将自动识别并保存完整 Cookie。
-        </span>
+        </span>}
         {loading && <span className="remote-sync-tag">正在同步云端操作…</span>}
       </div>
 
@@ -1033,11 +1063,86 @@ function RemoteBrowserViewport({
   );
 }
 
+function TaobaoVerificationDialog({ token, onDismiss, onCollected }: {
+  token: string;
+  onDismiss: (message?: string) => void;
+  onCollected: (product: MonitoredProduct & { message?: string }) => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+
+  function cancel() {
+    if (busy) return;
+    void fetch(`${verificationBase}/cancel`, {
+      method: 'POST', headers: verificationHeaders(token), keepalive: true,
+    }).catch(() => {});
+    onDismiss('已取消商品验证');
+  }
+
+  async function confirm() {
+    if (busy) return;
+    setBusy(true);
+    setMessage('');
+    try {
+      const response = await fetch(`${verificationBase}/confirm`, {
+        method: 'POST', headers: verificationHeaders(token), signal: AbortSignal.timeout(55000),
+      });
+      const data = (await response.json()) as MonitoredProduct & {
+        message?: string; code?: string; verificationAvailable?: boolean;
+      };
+      if (response.ok) {
+        onCollected(data);
+      } else if ([403, 410].includes(response.status) || (data.code && !data.verificationAvailable)) {
+        onDismiss(data.message || '商品验证已结束');
+      } else {
+        setMessage(data.message || '暂时无法继续采集');
+      }
+    } catch {
+      setMessage('暂时无法连接服务器，请稍后重试');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="product-verification-dialog"
+      aria-labelledby="taobao-verification-title"
+      onCancel={event => { event.preventDefault(); cancel(); }}
+    >
+      <h2 id="taobao-verification-title">淘宝商品验证</h2>
+      <RemoteBrowserViewport
+        platform="taobao"
+        verificationToken={token}
+        initialFrame={null}
+        onLoggedIn={() => {}}
+        onMessage={setMessage}
+      />
+      <p role="status" className="product-verification-status">{message}</p>
+      <div className="product-verification-actions">
+        <button type="button" className="apple-btn-secondary" onClick={cancel} disabled={busy}>取消</button>
+        <button type="button" className="apple-btn-primary" onClick={() => void confirm()} disabled={busy}>
+          {busy ? '正在采集…' : '确定'}
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
 function App() {
   const [activePage, setActivePage] = useState<NavPage>('home');
   const [status, setStatus] = useState('连接中');
   const [url, setUrl] = useState('');
   const [result, setResult] = useState('');
+  const [productVerification, setProductVerification] = useState<{ token: string; clearInput: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
 
   const [products, setProducts] = useState<MonitoredProduct[]>([]);
@@ -1338,27 +1443,35 @@ function App() {
     return () => window.clearInterval(t);
   }, [tbSmsCountdown]);
 
+  function applyCollectedProduct(product: MonitoredProduct) {
+    setProducts(prev => {
+      const idx = prev.findIndex(item => item.key === product.key);
+      if (idx < 0) return [product, ...prev];
+      const copy = [...prev];
+      copy[idx] = product;
+      return copy;
+    });
+    setSelectedKey(product.key);
+  }
+
   async function parse(event: React.FormEvent) {
     event.preventDefault();
     setBusy(true);
     setResult('');
     try {
+      const token = browserInteractionId();
       const response = await fetch('/api/products/parse?url=' + encodeURIComponent(url), {
+        headers: verificationHeaders(token),
         signal: AbortSignal.timeout(60000),
       });
-      const data = (await response.json()) as MonitoredProduct & { message?: string };
+      const data = (await response.json()) as MonitoredProduct & { message?: string; verificationAvailable?: boolean };
+      if (!response.ok && data.verificationAvailable) {
+        setProductVerification({ token, clearInput: true });
+        return;
+      }
       if (!response.ok) throw new Error(data.message || '商品链接识别或抓取失败');
       setResult(`${data.platformLabel || data.platform} · ${data.title.slice(0, 34)} — ${data.message}`);
-      setProducts(prev => {
-        const idx = prev.findIndex(p => p.key === data.key);
-        if (idx >= 0) {
-          const copy = [...prev];
-          copy[idx] = data;
-          return copy;
-        }
-        return [data, ...prev];
-      });
-      setSelectedKey(data.key);
+      applyCollectedProduct(data);
       setUrl('');
     } catch (error) {
       setResult(error instanceof Error && error.name === 'TimeoutError'
@@ -1373,15 +1486,17 @@ function App() {
   async function refreshProduct(item: MonitoredProduct) {
     setProductActionBusy(item.key);
     try {
+      const token = browserInteractionId();
       const res = await fetch(`/api/products/${encodeURIComponent(item.key)}/refresh`, {
-        method: 'POST', signal: AbortSignal.timeout(60000),
+        method: 'POST', headers: verificationHeaders(token), signal: AbortSignal.timeout(60000),
       });
-      const data = (await res.json()) as { product?: MonitoredProduct; message?: string };
-      if (!res.ok) throw new Error(data.message || '刷新失败');
-      if (data.product) {
-        setProducts(prev => prev.map(p => (p.key === data.product!.key ? data.product! : p)));
-        setSelectedKey(data.product.key);
+      const data = (await res.json()) as { product?: MonitoredProduct; message?: string; verificationAvailable?: boolean };
+      if (!res.ok && data.verificationAvailable) {
+        setProductVerification({ token, clearInput: false });
+        return;
       }
+      if (!res.ok) throw new Error(data.message || '刷新失败');
+      if (data.product) applyCollectedProduct(data.product);
       if (data.message) setResult(data.message);
     } catch (err) {
       setResult(err instanceof Error && err.name === 'TimeoutError'
@@ -1741,6 +1856,22 @@ function App() {
 
   return (
     <div className="macos-window">
+      {productVerification && (
+        <TaobaoVerificationDialog
+          key={productVerification.token}
+          token={productVerification.token}
+          onDismiss={message => {
+            setProductVerification(null);
+            setResult(message || '');
+          }}
+          onCollected={product => {
+            applyCollectedProduct(product);
+            if (productVerification.clearInput) setUrl('');
+            setProductVerification(null);
+            setResult(product.message || '商品采集完成');
+          }}
+        />
+      )}
       {/* 左侧 macOS 风格应用导航边栏 */}
       <aside className="macos-sidebar">
         <div className="sidebar-brand">

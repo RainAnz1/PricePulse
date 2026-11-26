@@ -12,23 +12,15 @@ import {
   Post,
   Req,
 } from '@nestjs/common';
-import { chromium, BrowserContext, CDPSession, Page } from 'playwright';
+import { chromium, BrowserContext, Page } from 'playwright';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Request } from 'express';
 import { notifySessionExpiredToFeishu } from './feishu';
+import { RemoteBrowserControls, RemotePointerInput } from './remote-browser-controls';
 
 type Platform = 'jd' | 'taobao';
-
-interface RemotePointer {
-  id: string;
-  page: Page;
-  timeout?: NodeJS.Timeout;
-  capture?: Promise<string>;
-  action?: Promise<void>;
-  release?: Promise<void>;
-}
 
 export interface StoredCookieItem {
   name: string;
@@ -1019,8 +1011,7 @@ async function open(platform: Platform): Promise<BrowserContext> {
 
 @Controller('sessions')
 export class SessionsController implements OnModuleInit, OnModuleDestroy {
-  private readonly remotePointers = new Map<Platform, RemotePointer>();
-  private readonly screenshotSessions = new WeakMap<Page, Promise<CDPSession>>();
+  private readonly remoteBrowser = new RemoteBrowserControls<Platform>();
   onModuleInit() {
     if (!keepAliveTimer) {
       // 每 10 分钟在服务端后台执行一次京东与淘宝登录态保活心跳
@@ -1037,8 +1028,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     keepAliveTimer = null;
     clearTimeout(headlessIdleTimer);
     if (headlessAuthClosing) await headlessAuthClosing;
-    for (const pointer of this.remotePointers.values()) clearTimeout(pointer.timeout);
-    this.remotePointers.clear();
+    await this.remoteBrowser.clear();
     const openContexts = [...contexts.values()];
     if (headlessAuthContext) openContexts.push(headlessAuthContext);
     await Promise.allSettled(openContexts.map(context => context.close()));
@@ -1062,32 +1052,6 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     return page;
   }
 
-  private captureDragFrame(pointer: RemotePointer): Promise<string> {
-    if (pointer.capture) return pointer.capture;
-
-    const page = pointer.page;
-    let session = this.screenshotSessions.get(page);
-    if (!session) {
-      session = page.context().newCDPSession(page);
-      this.screenshotSessions.set(page, session);
-    }
-    pointer.capture = session
-      .then(async client => {
-        const { data } = await client.send('Page.captureScreenshot', {
-          format: 'jpeg', quality: 55, optimizeForSpeed: true,
-        });
-        return `data:image/jpeg;base64,${data}`;
-      })
-      .catch(async () => {
-        const image = await page.screenshot({ type: 'jpeg', quality: 55, timeout: 2000 }).catch(() => null);
-        return image ? `data:image/jpeg;base64,${image.toString('base64')}` : '';
-      })
-      .finally(() => {
-        pointer.capture = undefined;
-      });
-    return pointer.capture;
-  }
-
   private async closeCompletedLoginPage(platform: Platform, page: Page | null) {
     if (!page) return;
     // Keep the shared context and its cookies alive while releasing the login tab.
@@ -1105,8 +1069,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     const url = platformUrl(page.url(), platform);
     const host = url?.hostname;
     const onJdChallenge = host === 'aq.jd.com' || host === 'safe.jd.com' || host === 'cfe.m.jd.com';
-    const pointer = this.remotePointers.get(platform);
-    const dragging = pointer?.page === page;
+    const dragging = this.remoteBrowser.isDragging(platform, page);
     if (!dragging && platform === 'jd' && host && !onJdChallenge) {
       const saved = await syncCookiesFromHeadlessContext({}, source, { mobile });
       if (saved) {
@@ -1138,13 +1101,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    let screenshot = '';
-    if (url && dragging) {
-      screenshot = await this.captureDragFrame(pointer);
-    } else if (url) {
-      const image = await page.screenshot({ type: 'jpeg', quality: 78, timeout: 6500 }).catch(() => null);
-      if (image) screenshot = `data:image/jpeg;base64,${image.toString('base64')}`;
-    }
+    const screenshot = url ? await this.remoteBrowser.screenshot(platform, page) : '';
     const title = url && !dragging ? await page.title().catch(() => '') : '';
 
     return {
@@ -1196,79 +1153,15 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     return page;
   }
 
-  private async releaseRemotePointer(platform: Platform, pointer: RemotePointer) {
-    clearTimeout(pointer.timeout);
-    if (this.remotePointers.get(platform) !== pointer) return;
-    pointer.release ??= (async () => {
-      await pointer.action?.catch(() => {});
-      await pointer.page.mouse.up();
-    })().finally(() => {
-      if (this.remotePointers.get(platform) === pointer) this.remotePointers.delete(platform);
-    });
-    await pointer.release;
-  }
-
   @Post(':platform/remote/pointer')
   async updateRemotePointer(
     @Param('platform') input: string,
-    @Body() body: { id?: string; type?: 'down' | 'move' | 'up' | 'cancel'; x?: number; y?: number },
+    @Body() body: RemotePointerInput,
     @Req() req: Request,
   ) {
     validateOrigin(req);
     const platform = platformOf(input);
-    const id = body?.id;
-    const type = body?.type;
-    if (typeof id !== 'string' || !/^[a-zA-Z0-9-]{1,64}$/.test(id) ||
-        !type || !['down', 'move', 'up', 'cancel'].includes(type)) {
-      throw new BadRequestException('鼠标操作无效');
-    }
-    const current = this.remotePointers.get(platform);
-    if (type === 'cancel') {
-      if (current?.id === id) await this.releaseRemotePointer(platform, current);
-      return { ok: true };
-    }
-
-    const { x, y } = body;
-    if (typeof x !== 'number' || !Number.isFinite(x) || typeof y !== 'number' || !Number.isFinite(y)) {
-      throw new BadRequestException('鼠标坐标无效');
-    }
-
-    const page = this.getPointerPage(platform);
-    let pointer: RemotePointer;
-    if (type === 'down') {
-      if (current && current.page === page) {
-        throw new BadRequestException('上一次鼠标操作尚未结束');
-      }
-      if (current) clearTimeout(current.timeout);
-      pointer = { id, page };
-      this.remotePointers.set(platform, pointer);
-    } else {
-      if (!current || current.id !== id || current.page !== page || current.release) {
-        throw new BadRequestException('鼠标操作已结束，请重新按下');
-      }
-      pointer = current;
-    }
-
-    clearTimeout(pointer.timeout);
-    pointer.timeout = setTimeout(() => {
-      void this.releaseRemotePointer(platform, pointer).catch(() => {});
-    }, 10000);
-    pointer.timeout.unref();
-
-    try {
-      const width = page.viewportSize()?.width ?? 1280;
-      const height = page.viewportSize()?.height ?? 800;
-      pointer.action = (pointer.action ?? Promise.resolve()).then(async () => {
-        await page.mouse.move(Math.max(0, Math.min(width - 1, x)), Math.max(0, Math.min(height - 1, y)));
-        if (type === 'down') await page.mouse.down();
-      });
-      await pointer.action;
-      if (type === 'up') await this.releaseRemotePointer(platform, pointer);
-    } catch (error) {
-      await this.releaseRemotePointer(platform, pointer).catch(() => {});
-      throw error;
-    }
-    return { ok: true };
+    return this.remoteBrowser.update(platform, () => this.getPointerPage(platform), body);
   }
 
   /**
@@ -1301,7 +1194,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     }
     const page = await this.getOrCreateRemotePage(platform, { keepCurrent: true });
     if (!platformUrl(page.url(), platform)) throw new BadRequestException('平台登录页尚未就绪');
-    if (this.remotePointers.get(platform)?.page === page) {
+    if (this.remoteBrowser.isDragging(platform, page)) {
       throw new BadRequestException('请先松开鼠标再继续操作');
     }
 

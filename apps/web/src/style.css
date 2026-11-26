@@ -1432,6 +1432,42 @@ body {
 }
 
 /* 云端实时浏览器可视化验证与交互面板 */
+.product-verification-dialog {
+  width: min(900px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: 16px;
+  border: 1px solid var(--apple-divider-strong);
+  border-radius: 14px;
+  background: var(--apple-surface);
+  color: var(--apple-ink);
+}
+
+.product-verification-dialog::backdrop {
+  background: rgb(0 0 0 / 38%);
+}
+
+.product-verification-dialog h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.product-verification-dialog .remote-stage-wrap {
+  width: min(100%, 92.8dvh, 832px);
+  margin-inline: auto;
+}
+
+.product-verification-status {
+  min-height: 18px;
+  margin: 8px 0 4px;
+  font-size: 13px;
+}
+
+.product-verification-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .remote-browser-box {
   margin-top: 12px;
   border-radius: 14px;

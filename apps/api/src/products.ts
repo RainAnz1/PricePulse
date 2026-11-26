@@ -1,10 +1,12 @@
 import {
   BadRequestException,
+  Body,
   Controller,
   Delete,
   ForbiddenException,
   GatewayTimeoutException,
   Get,
+  Header,
   Logger,
   NotFoundException,
   OnModuleInit,
@@ -18,7 +20,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Request } from 'express';
-import type { Page } from 'playwright';
+import type { Page, Response as BrowserResponse } from 'playwright';
 import { ProductIdentity, resolveAndParseProductUrl } from './product-url';
 import {
   getDataRoot,
@@ -28,6 +30,12 @@ import {
 } from './sessions';
 import { notifyDelistToFeishu, notifyPriceDropToFeishu } from './feishu';
 import { readJdDisplayedPrice, resolveJdPrice } from './jd-price';
+import type { RemotePointerInput } from './remote-browser-controls';
+import {
+  checkTaobaoVerificationPage, closeTaobaoVerification, detachTaobaoVerification, holdTaobaoVerification,
+  isRequestedTaobaoPage, isTaobaoVerificationTitle, ownedTaobaoVerification, requireTaobaoVerification,
+  TaobaoVerification, verificationAccess, verificationBrowser,
+} from './taobao-verification';
 
 export interface PriceHistoryPoint {
   timestamp: string;
@@ -979,7 +987,24 @@ function isTaobaoLoginPage(url: string): boolean {
   return host === 'login.taobao.com' || host === 'login.m.taobao.com';
 }
 
-async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSignal) {
+interface TaobaoCollectionOptions {
+  access?: ReturnType<typeof verificationAccess>;
+  resume?: TaobaoVerification;
+}
+
+function errorWithVerificationWindow(error: unknown, access?: TaobaoCollectionOptions['access']) {
+  if (ownedTaobaoVerification(access) && error instanceof BadRequestException) {
+    const response = error.getResponse() as { code?: string };
+    if (response.code === 'TAOBAO_VERIFICATION_REQUIRED') {
+      return new BadRequestException({ ...response, verificationAvailable: true });
+    }
+  }
+  return error;
+}
+
+async function scrapeTaobaoProduct(
+  identity: ProductIdentity, signal: AbortSignal, { access, resume }: TaobaoCollectionOptions,
+) {
   const collectionId = randomUUID();
   const startedAt = Date.now();
   const collectionError = (code: TaobaoCollectionCode) => {
@@ -1014,44 +1039,48 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
   let sessionExpired = false;
 
   try {
-    const context = await getTaobaoHeadlessContext();
+    const context = resume ? resume.page.context() : await getTaobaoHeadlessContext();
     signal.throwIfAborted();
-    const page = await context.newPage();
+    const page = resume?.page ?? await context.newPage();
     const detachTimeout = closeProductPageOnTimeout(page, signal);
+    let held = false;
+    const mtopPayloads = resume?.responses ?? [];
+    let verificationRequired = false;
+    const captureResponse = async (res: BrowserResponse) => {
+      const url = new URL(res.url());
+      if ((url.hostname !== 'h5api.m.taobao.com' && url.hostname !== 'h5api.m.tmall.com') ||
+          !/^\/h5\/mtop\.taobao\.(?:pcdetail\.data\.get|detail\.(?:getdetail|data\.get))(?:\/|$)/i.test(url.pathname)) {
+        return;
+      }
+      try {
+        const text = await res.text();
+        if (text.includes('SUCCESS::')) {
+          mtopPayloads.push(text);
+          if (mtopPayloads.length > 8) mtopPayloads.shift();
+        } else if (text.includes('RGV587_ERROR')) {
+          verificationRequired = true;
+        } else if (text.includes('FAIL_SYS_SESSION_EXPIRED')) {
+          sessionExpired = true;
+        }
+      } catch {
+        // A response can disappear during navigation.
+      }
+    };
+    const stopCapturing = () => { page.off('response', captureResponse); };
 
     try {
       signal.throwIfAborted();
-      page.on('popup', popup => { void popup.close().catch(() => {}); });
-      // Product collection needs the price text and image URLs, with no need to download media.
-      await page.route('**/*', route => {
-        const type = route.request().resourceType();
-        return type === 'image' || type === 'media' || type === 'font' ? route.abort() : route.fallback();
-      });
-      const mtopPayloads: string[] = [];
-      let verificationRequired = false;
-      page.on('response', async res => {
-        const u = res.url();
-        const isMtopHost = u.includes('h5api.m.taobao.com/h5/mtop.') || u.includes('h5api.m.tmall.com/h5/mtop.');
-        if (
-          isMtopHost &&
-          (u.includes('mtop.taobao.pcdetail.data.get') ||
-            u.includes('mtop.taobao.detail.getdetail') ||
-            u.includes('mtop.taobao.detail.data.get'))
-        ) {
-          try {
-            const text = await res.text();
-            if (text && text.includes('SUCCESS::')) {
-              mtopPayloads.push(text);
-            } else if (text.includes('RGV587_ERROR')) {
-              verificationRequired = true;
-            } else if (text.includes('FAIL_SYS_SESSION_EXPIRED')) {
-              sessionExpired = true;
-            }
-          } catch {
-            // ignore
-          }
-        }
-      });
+      if (!resume) {
+        page.on('popup', popup => { void popup.close().catch(() => {}); });
+        await page.route('**/*', route => {
+          const type = route.request().resourceType();
+          return (type === 'image' && !access) || type === 'media' || type === 'font' ? route.abort() : route.fallback();
+        });
+      }
+      page.on('response', captureResponse);
+      let useCurrentDocument = Boolean(resume && isRequestedTaobaoPage(page.url(), identity) &&
+        (!identity.skuId || new URL(page.url()).searchParams.get('skuId') === identity.skuId) &&
+        !isTaobaoVerificationTitle(await page.title().catch(() => '')));
 
       const urlsToTry = new Set([
         identity.canonicalUrl,
@@ -1059,12 +1088,13 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
       ]);
 
       for (const targetUrl of urlsToTry) {
-        await page
-          .goto(targetUrl, {
+        if (!useCurrentDocument) {
+          await page.goto(targetUrl, {
             waitUntil: 'domcontentloaded',
             timeout: 20000,
-          })
-          .catch(() => {});
+          }).catch(() => {});
+        }
+        useCurrentDocument = false;
 
         let loginTicksWithoutQuickBtn = 0;
         let quickLoginClicked = false;
@@ -1080,7 +1110,12 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
               priceReady: Array.from(priceElements).some(el => /\d/.test(el.textContent || '')),
             };
           }).catch(() => null);
-          if (verificationRequired || /^(?:CAPTCHA Verification|安全验证|访问验证|人机验证)$/i.test(pageState?.title.trim() || '')) {
+          const hasChallengePage = isTaobaoVerificationTitle(pageState?.title);
+          if (hasChallengePage || verificationRequired) {
+            if (hasChallengePage && access) {
+              signal.throwIfAborted();
+              held = holdTaobaoVerification(access, identity, page, mtopPayloads, stopCapturing);
+            }
             throw collectionError('TAOBAO_VERIFICATION_REQUIRED');
           }
           if (mtopPayloads.length > 0) {
@@ -1294,7 +1329,10 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
       }
     } finally {
       detachTimeout();
-      await page.close().catch(() => {});
+      if (!held) {
+        stopCapturing();
+        await page.close().catch(() => {});
+      }
     }
   } catch (error) {
     if (error instanceof BadRequestException) throw error;
@@ -1365,13 +1403,13 @@ function productCollectionBusy(key: string, reason: 'queue_full' | 'queue_timeou
 }
 
 export async function scrapeAndUpsertProduct(
-  rawUrl?: string, { waitForSlot = true } = {},
+  rawUrl?: string, { waitForSlot = true, access }: TaobaoCollectionOptions & { waitForSlot?: boolean } = {},
 ): Promise<ProductScrapeResult> {
   const identity = await resolveAndParseProductUrl(rawUrl);
   const key = `${identity.platform}:${identity.id}:${identity.skuId || 'default'}`;
   if (activeScrape?.key === key) return activeScrape.response;
   if (pendingScrape?.key === key) return pendingScrape.response;
-  if (!activeScrape && !pendingScrape) return startProductScrape(identity, key);
+  if (!activeScrape && !pendingScrape) return startProductScrape(identity, key, { access });
   if (!waitForSlot) throw new ServiceUnavailableException('服务端正在采集另一个商品');
   if (!activeScrape || pendingScrape) throw productCollectionBusy(key, 'queue_full');
 
@@ -1384,7 +1422,7 @@ export async function scrapeAndUpsertProduct(
     .then(() => {
       clearTimeout(waitTimer);
       pendingScrape = undefined;
-      return startProductScrape(identity, key);
+      return startProductScrape(identity, key, { access });
     })
     .finally(() => {
       clearTimeout(waitTimer);
@@ -1394,7 +1432,9 @@ export async function scrapeAndUpsertProduct(
   return response;
 }
 
-function startProductScrape(identity: ProductIdentity, key: string): Promise<ProductScrapeResult> {
+function startProductScrape(
+  identity: ProductIdentity, key: string, options: TaobaoCollectionOptions,
+): Promise<ProductScrapeResult> {
   const signal = AbortSignal.timeout(45000);
   function releaseSlot() {
     signal.removeEventListener('abort', onTimeout);
@@ -1405,7 +1445,7 @@ function startProductScrape(identity: ProductIdentity, key: string): Promise<Pro
     onTimeout = () => reject(new GatewayTimeoutException('商品详情采集超时，请稍后重试'));
     signal.addEventListener('abort', onTimeout, { once: true });
   });
-  const work = scrapeAndSaveProduct(identity, key, signal);
+  const work = scrapeAndSaveProduct(identity, key, signal, options);
   const response = Promise.race([work, timeout]);
   // Keep the browser slot occupied until the timed-out page has closed.
   const finished = work.then(releaseSlot, releaseSlot);
@@ -1414,12 +1454,12 @@ function startProductScrape(identity: ProductIdentity, key: string): Promise<Pro
 }
 
 async function scrapeAndSaveProduct(
-  identity: ProductIdentity, key: string, signal: AbortSignal,
+  identity: ProductIdentity, key: string, signal: AbortSignal, options: TaobaoCollectionOptions,
 ): Promise<ProductScrapeResult> {
   const scraped =
     identity.platform === 'jd'
       ? await scrapeJdProduct(identity, signal)
-      : await scrapeTaobaoProduct(identity, signal);
+      : await scrapeTaobaoProduct(identity, signal, options);
   signal.throwIfAborted();
   const products = loadMonitoredProducts();
   const existingIdx = products.findIndex(p => p.key === key);
@@ -1598,8 +1638,20 @@ export class ProductsController implements OnModuleInit {
   }
 
   @Get('parse')
-  async parse(@Query('url') input?: string) {
-    const { product, isNew, priceDropped, feishuPushed } = await scrapeAndUpsertProduct(input);
+  async parse(@Query('url') input?: string, @Req() req?: Request) {
+    return this.formatCollection(await this.collect(input, req));
+  }
+
+  private async collect(input?: string, req?: Request) {
+    const access = verificationAccess(req);
+    try {
+      return await scrapeAndUpsertProduct(input, { access });
+    } catch (error) {
+      throw errorWithVerificationWindow(error, access);
+    }
+  }
+
+  private formatCollection({ product, isNew, priceDropped, feishuPushed }: ProductScrapeResult) {
     const subsidyNote = product.hasSubsidy
       ? ` ｜ 国补后到手 ¥${product.finalPrice.toFixed(2)} (${product.subsidyLabel})`
       : ` ｜ 预估到手 ¥${product.finalPrice.toFixed(2)}`;
@@ -1615,13 +1667,70 @@ export class ProductsController implements OnModuleInit {
     };
   }
 
+  @Get('verification/frame')
+  @Header('Cache-Control', 'no-store')
+  async getVerificationFrame(@Req() req: Request) {
+    const verification = requireTaobaoVerification(req);
+    const page = verification.page;
+    if (!await checkTaobaoVerificationPage(verification)) return { state: 'ready' };
+    const screenshot = await verificationBrowser.screenshot(page, page);
+    if (!await checkTaobaoVerificationPage(verification)) return { state: 'ready' };
+    const url = new URL(page.url());
+    return {
+      state: 'verify_required',
+      url: url.origin + url.pathname,
+      screenshot,
+      viewport: page.viewportSize() ?? { width: 1280, height: 800 },
+      message: screenshot ? undefined : '暂时无法显示实时画面',
+    };
+  }
+
+  @Post('verification/pointer')
+  async verificationPointer(@Req() req: Request, @Body() body: RemotePointerInput) {
+    const verification = requireTaobaoVerification(req);
+    const page = verification.page;
+    if (body?.type === 'down' && !await checkTaobaoVerificationPage(verification)) {
+      throw new BadRequestException('商品验证已完成，请点确定继续采集');
+    }
+    return verificationBrowser.update(page, () => {
+      if (!isRequestedTaobaoPage(page.url(), verification.identity)) {
+        throw new BadRequestException('验证页面已离开该商品');
+      }
+      return page;
+    }, body);
+  }
+
+  @Post('verification/confirm')
+  async confirmVerification(@Req() req: Request) {
+    const verification = requireTaobaoVerification(req);
+    if (await checkTaobaoVerificationPage(verification)) {
+      throw new BadRequestException('请先在淘宝画面中完成验证，再点确定');
+    }
+    const { identity, page, access } = verification;
+    if (verificationBrowser.isDragging(page, page)) throw new BadRequestException('请先松开鼠标再确定');
+    if (activeScrape || pendingScrape) throw new ServiceUnavailableException('另一项商品正在采集，请稍后再点确定');
+    detachTaobaoVerification(verification);
+    const key = `${identity.platform}:${identity.id}:${identity.skuId || 'default'}`;
+    try {
+      return this.formatCollection(await startProductScrape(identity, key, { access, resume: verification }));
+    } catch (error) {
+      throw errorWithVerificationWindow(error, access);
+    }
+  }
+
+  @Post('verification/cancel')
+  async cancelVerification(@Req() req: Request) {
+    await closeTaobaoVerification(requireTaobaoVerification(req));
+    return { ok: true };
+  }
+
   @Post(':id/refresh')
   async refreshOne(@Param('id') id: string, @Req() req: Request) {
     validateOrigin(req);
     const products = loadMonitoredProducts();
     const target = products.find(p => p.id === id || p.key === id);
     if (!target) throw new NotFoundException('未找到该监控商品');
-    const result = await scrapeAndUpsertProduct(target.canonicalUrl);
+    const result = await this.collect(target.canonicalUrl, req);
     return {
       ...result,
       message: `已刷新「${result.product.title.slice(0, 24)}…」最新到手价 ¥${result.product.finalPrice.toFixed(2)}`,
