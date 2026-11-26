@@ -90,7 +90,31 @@ test('temporary JD failures preserve the session and confirmed expiry sends one 
   assert.equal((await new SessionsController().getTaobaoStatus()).state, 'logged_in');
 });
 
-test('product collection shares the same SKU job and blocks concurrent browser pages', async t => {
+test('Taobao product verification is reported separately from login expiry', async t => {
+  const item = 'https://item.taobao.com/item.htm?id=123456&skuId=4321';
+  const page = {
+    on() {},
+    async route() {},
+    async goto() {},
+    async waitForTimeout() {},
+    url: () => item,
+    evaluate: t.mock.fn(async () => ({ title: 'CAPTCHA Verification', priceReady: false })),
+    close: t.mock.fn(async () => {}),
+  };
+  t.mock.method(sessionModule, 'getTaobaoHeadlessContext', async () => ({
+    newPage: async () => page,
+  }));
+
+  await assert.rejects(scrapeAndUpsertProduct(item), error => {
+    assert.equal(error.getResponse().code, 'TAOBAO_VERIFICATION_REQUIRED');
+    assert.match(error.message, /商品页.*人机验证/);
+    return true;
+  });
+  assert.equal(page.evaluate.mock.callCount(), 1);
+  assert.equal(page.close.mock.callCount(), 1);
+});
+
+test('product collection shares a SKU job and queues one manual request without opening a second browser page', async t => {
   let markStarted;
   let failBrowser;
   const started = new Promise(resolve => { markStarted = resolve; });
@@ -99,15 +123,28 @@ test('product collection shares the same SKU job and blocks concurrent browser p
     markStarted();
     return browser;
   });
+  const launchJd = t.mock.method(sessionModule, 'getJdHeadlessContext', async () => {
+    throw new Error('fixture JD browser stopped');
+  });
+  const fetchedJd = t.mock.method(globalThis, 'fetch', async input => {
+    assert.equal(new URL(input).hostname, 'item.m.jd.com');
+    return new Response('');
+  });
   const item = 'https://item.taobao.com/item.htm?id=123456&skuId=4321';
   const first = scrapeAndUpsertProduct(item + '&pvid=fixture');
   await started;
   const duplicate = scrapeAndUpsertProduct(item + '&utparam=fixture');
-  const results = Promise.allSettled([first, duplicate]);
+  const jd = scrapeAndUpsertProduct('https://item.jd.com/12345678.html');
+  const results = Promise.allSettled([first, duplicate, jd]);
   await assert.rejects(scrapeAndUpsertProduct(item.replace('4321', '2345')), { status: 503 });
   assert.equal(launch.mock.callCount(), 1);
+  assert.equal(fetchedJd.mock.callCount(), 0);
   failBrowser(new Error('fixture browser stopped'));
-  assert.deepEqual((await results).map(result => result.reason.status), [400, 400]);
+  const settled = await results;
+  assert.deepEqual(settled.slice(0, 2).map(result => result.reason.status), [400, 400]);
+  assert.notEqual(settled[2].reason?.status, 503);
+  assert.equal(fetchedJd.mock.callCount(), 1);
+  assert.equal(launchJd.mock.callCount(), 1);
 
   await assert.rejects(scrapeAndUpsertProduct(item), { status: 400 });
   assert.equal(launch.mock.callCount(), 2);

@@ -5,6 +5,7 @@ import {
   ForbiddenException,
   GatewayTimeoutException,
   Get,
+  Logger,
   NotFoundException,
   OnModuleInit,
   Param,
@@ -13,6 +14,7 @@ import {
   Req,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Request } from 'express';
@@ -23,7 +25,6 @@ import {
   getJdHeadlessContext,
   getTaobaoHeadlessContext,
   loadPersistedJdSession,
-  loadPersistedTaobaoSession,
 } from './sessions';
 import { notifyDelistToFeishu, notifyPriceDropToFeishu } from './feishu';
 import { readJdDisplayedPrice, resolveJdPrice } from './jd-price';
@@ -916,7 +917,35 @@ function parseTaobaoMtopJson(rawText: string, targetSkuId: string | null): Parti
   }
 }
 
+const productLogger = new Logger('ProductCollection');
+const taobaoCollectionMessages = {
+  TAOBAO_VERIFICATION_REQUIRED: '淘宝商品页要求进行人机验证，暂时无法读取价格。账号已登录时也可能触发商品页验证。',
+  TAOBAO_SESSION_EXPIRED: '淘宝商品接口提示登录已过期，请重新扫码登录后重试。',
+  TAOBAO_LOGIN_REQUIRED: '淘宝商品页跳转到了登录页面，请重新扫码登录后重试。',
+  TAOBAO_PRICE_UNAVAILABLE: '淘宝商品页没有返回可识别的价格，请确认该规格在售后重试。',
+  TAOBAO_BROWSER_ERROR: '服务端浏览器未能完成淘宝商品采集，请稍后重试。',
+} as const;
+type TaobaoCollectionCode = keyof typeof taobaoCollectionMessages;
+
+function isTaobaoLoginPage(url: string): boolean {
+  const host = new URL(url).hostname;
+  return host === 'login.taobao.com' || host === 'login.m.taobao.com';
+}
+
 async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSignal) {
+  const collectionId = randomUUID();
+  const startedAt = Date.now();
+  const collectionError = (code: TaobaoCollectionCode) => {
+    productLogger.warn(JSON.stringify({
+      event: 'taobao_product_collection_failed',
+      collectionId,
+      code,
+      itemId: identity.id,
+      skuId: identity.skuId,
+      elapsedMs: Date.now() - startedAt,
+    }));
+    return new BadRequestException({ message: taobaoCollectionMessages[code], code });
+  };
   const isTmall = Boolean(identity.isTmall || identity.canonicalUrl.includes('tmall.com'));
   const defaultShop = isTmall ? '天猫官方旗舰店' : '淘宝店铺';
   const defaultSpec = identity.skuId ? `规格 ${identity.skuId}` : '默认规格';
@@ -935,6 +964,7 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
   let stockText = '在售';
   let combinedRawText = '';
   let redirectedToLogin = false;
+  let sessionExpired = false;
 
   try {
     const context = await getTaobaoHeadlessContext();
@@ -951,6 +981,7 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
         return type === 'image' || type === 'media' || type === 'font' ? route.abort() : route.fallback();
       });
       const mtopPayloads: string[] = [];
+      let verificationRequired = false;
       page.on('response', async res => {
         const u = res.url();
         const isMtopHost = u.includes('h5api.m.taobao.com/h5/mtop.') || u.includes('h5api.m.tmall.com/h5/mtop.');
@@ -964,8 +995,10 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
             const text = await res.text();
             if (text && text.includes('SUCCESS::')) {
               mtopPayloads.push(text);
-            } else if (text && (text.includes('RGV587_ERROR') || text.includes('FAIL_SYS_SESSION_EXPIRED'))) {
-              redirectedToLogin = true;
+            } else if (text.includes('RGV587_ERROR')) {
+              verificationRequired = true;
+            } else if (text.includes('FAIL_SYS_SESSION_EXPIRED')) {
+              sessionExpired = true;
             }
           } catch {
             // ignore
@@ -991,13 +1024,25 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
 
         for (let i = 0; i < 24; i++) {
           await page.waitForTimeout(300);
+          const pageState = await page.evaluate(() => {
+            const priceElements = document.querySelectorAll(
+              '[class*="highlightPrice"] [class*="priceText"], [class*="Price--priceText"], .tb-rmb-num, .tm-price',
+            );
+            return {
+              title: document.title,
+              priceReady: Array.from(priceElements).some(el => /\d/.test(el.textContent || '')),
+            };
+          }).catch(() => null);
+          if (verificationRequired || /^(?:CAPTCHA Verification|安全验证|访问验证|人机验证)$/i.test(pageState?.title.trim() || '')) {
+            throw collectionError('TAOBAO_VERIFICATION_REQUIRED');
+          }
           if (mtopPayloads.length > 0) {
             redirectedToLogin = false;
+            sessionExpired = false;
             break;
           }
 
-          const curUrl = page.url();
-          if (curUrl.includes('login.taobao.com') || curUrl.includes('login.m.taobao.com')) {
+          if (isTaobaoLoginPage(page.url())) {
             redirectedToLogin = true;
             if (quickLoginClicked) continue;
             const loginState = await page
@@ -1024,29 +1069,16 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
             continue;
           }
 
-          // 检查是否仍在 5KB rgv587_flag:sm 跳转壳子页 (#a-link)，若是则继续等待其自动跳转
-          const pageStage = await page
-            .evaluate(() => {
-              const isJumpShell =
-                Boolean(document.getElementById('a-link')) &&
-                !document.querySelector('h1, [class*="mainTitle"], [class*="ItemTitle"], [class*="Price--"]');
-              if (isJumpShell) return 'jump_shell';
-              const priceElements = document.querySelectorAll(
-                '[class*="highlightPrice"] [class*="priceText"], [class*="Price--priceText"], .tb-rmb-num, .tm-price',
-              );
-              const priceReady = Array.from(priceElements).some(el => /\d/.test(el.textContent || ''));
-              return priceReady ? 'detail_ready' : 'loading';
-            })
-            .catch(() => 'loading');
-
-          if (pageStage === 'detail_ready') {
+          if (pageState?.priceReady) {
             redirectedToLogin = false;
+            sessionExpired = false;
             await page.waitForTimeout(450);
             break;
           }
         }
 
-        if ((!page.url().includes('login.taobao.com') && !redirectedToLogin) || mtopPayloads.length > 0) {
+        if (verificationRequired) throw collectionError('TAOBAO_VERIFICATION_REQUIRED');
+        if ((!isTaobaoLoginPage(page.url()) && !redirectedToLogin && !sessionExpired) || mtopPayloads.length > 0) {
           break;
         }
       }
@@ -1071,7 +1103,7 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
       }
 
       // 2. 从渲染后的 DOM 提取标题、主图、店铺名、已选 SKU 规格与价格（兼容 2025/2026 淘宝天猫新版 SSR/ICE 详情页）
-      if (!page.url().includes('login.taobao.com') && !page.url().includes('login.m.taobao.com')) {
+      if (!isTaobaoLoginPage(page.url())) {
         const domInfo = await page
           .evaluate(() => {
             const clean = (s?: string | null) => (s || '').replace(/\s+/g, ' ').trim();
@@ -1217,16 +1249,16 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
       detachTimeout();
       await page.close().catch(() => {});
     }
-  } catch {
-    // ignore headless browser launch/scrape error and check extracted fields below
+  } catch (error) {
+    if (error instanceof BadRequestException) throw error;
+    signal.throwIfAborted();
+    if (!pagePrice) throw collectionError('TAOBAO_BROWSER_ERROR');
   }
 
-  if (!pagePrice || pagePrice <= 0) {
-    throw new BadRequestException(
-      redirectedToLogin
-        ? '淘宝 / 天猫商品详情页触发登录校验，请先前往左侧「平台账号与服务端会话」使用淘宝 App 重新扫码登录，同步完整服务端 Cookie 后再添加'
-        : '未能从淘宝 / 天猫页面解析到真实商品价格，请先在「平台账号与服务端会话」中确认淘宝账号已扫码登录并处于有效状态',
-    );
+  if (pagePrice <= 0) {
+    if (sessionExpired) throw collectionError('TAOBAO_SESSION_EXPIRED');
+    if (redirectedToLogin) throw collectionError('TAOBAO_LOGIN_REQUIRED');
+    throw collectionError('TAOBAO_PRICE_UNAVAILABLE');
   }
 
   const finalTitle = title || identity.hintTitle || `${isTmall ? '天猫' : '淘宝'}商品 #${identity.id}`;
@@ -1266,17 +1298,61 @@ interface ProductScrapeResult {
   feishuPushed: boolean;
 }
 
-let activeScrape: { key: string; response: Promise<ProductScrapeResult> } | undefined;
+interface ProductScrapeRequest {
+  key: string;
+  response: Promise<ProductScrapeResult>;
+}
 
-export async function scrapeAndUpsertProduct(rawUrl?: string): Promise<ProductScrapeResult> {
+let activeScrape: (ProductScrapeRequest & { finished: Promise<void> }) | undefined;
+let pendingScrape: ProductScrapeRequest | undefined;
+
+function productCollectionBusy(key: string, reason: 'queue_full' | 'queue_timeout') {
+  productLogger.warn(JSON.stringify({
+    event: 'product_collection_busy',
+    collectionId: randomUUID(),
+    key,
+    activeKey: activeScrape?.key,
+    reason,
+  }));
+  return new ServiceUnavailableException('前一项商品采集尚未完成，请稍后再试');
+}
+
+export async function scrapeAndUpsertProduct(
+  rawUrl?: string, { waitForSlot = true } = {},
+): Promise<ProductScrapeResult> {
   const identity = await resolveAndParseProductUrl(rawUrl);
   const key = `${identity.platform}:${identity.id}:${identity.skuId || 'default'}`;
-  if (activeScrape) {
-    if (activeScrape.key === key) return activeScrape.response;
-    throw new ServiceUnavailableException('服务端正在采集另一个商品，请稍后重试');
-  }
+  if (activeScrape?.key === key) return activeScrape.response;
+  if (pendingScrape?.key === key) return pendingScrape.response;
+  if (!activeScrape && !pendingScrape) return startProductScrape(identity, key);
+  if (!waitForSlot) throw new ServiceUnavailableException('服务端正在采集另一个商品');
+  if (!activeScrape || pendingScrape) throw productCollectionBusy(key, 'queue_full');
 
+  let waitTimer: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<never>((_, reject) => {
+    waitTimer = setTimeout(() => reject(productCollectionBusy(key, 'queue_timeout')), 8000);
+    waitTimer.unref();
+  });
+  const response = Promise.race([activeScrape.finished, deadline])
+    .then(() => {
+      clearTimeout(waitTimer);
+      pendingScrape = undefined;
+      return startProductScrape(identity, key);
+    })
+    .finally(() => {
+      clearTimeout(waitTimer);
+      if (pendingScrape?.response === response) pendingScrape = undefined;
+    });
+  pendingScrape = { key, response };
+  return response;
+}
+
+function startProductScrape(identity: ProductIdentity, key: string): Promise<ProductScrapeResult> {
   const signal = AbortSignal.timeout(45000);
+  function releaseSlot() {
+    signal.removeEventListener('abort', onTimeout);
+    if (activeScrape?.response === response) activeScrape = undefined;
+  }
   let onTimeout: () => void;
   const timeout = new Promise<never>((_, reject) => {
     onTimeout = () => reject(new GatewayTimeoutException('商品详情采集超时，请稍后重试'));
@@ -1284,12 +1360,9 @@ export async function scrapeAndUpsertProduct(rawUrl?: string): Promise<ProductSc
   });
   const work = scrapeAndSaveProduct(identity, key, signal);
   const response = Promise.race([work, timeout]);
-  activeScrape = { key, response };
   // Keep the browser slot occupied until the timed-out page has closed.
-  void work.finally(() => {
-    signal.removeEventListener('abort', onTimeout);
-    if (activeScrape?.response === response) activeScrape = undefined;
-  }).catch(() => {});
+  const finished = work.then(releaseSlot, releaseSlot);
+  activeScrape = { key, response, finished };
   return response;
 }
 
@@ -1460,7 +1533,7 @@ export class ProductsController implements OnModuleInit {
         const list = loadMonitoredProducts();
         for (const item of list) {
           try {
-            await scrapeAndUpsertProduct(item.canonicalUrl);
+            await scrapeAndUpsertProduct(item.canonicalUrl, { waitForSlot: false });
           } catch {
             // ignore single item failure during background poll
           }
