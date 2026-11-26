@@ -306,7 +306,7 @@ export async function notifySessionExpiredToFeishu(platform: 'jd' | 'taobao', de
           content: [
             `**告警平台**：${platformName}`,
             `**告警原因**：${detail || '检测到登录 Cookie 已过期或触发登录拦截，可能影响券后价与国补价格抓取'}`,
-            `**处理建议**：请打开 Price Drop 本地监控面板（http://127.0.0.1:8090）重新扫码登录。`,
+            `**处理建议**：请打开 PricePulse 的平台账号页面，重新登录并完成平台验证。`,
           ].join('\n'),
         },
       },

@@ -4,6 +4,7 @@ import {
   Controller,
   ForbiddenException,
   Get,
+  Header,
   InternalServerErrorException,
   OnModuleInit,
   Param,
@@ -11,7 +12,7 @@ import {
   Req,
 } from '@nestjs/common';
 import { chromium, BrowserContext, Page } from 'playwright';
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { Request } from 'express';
 import { notifySessionExpiredToFeishu } from './feishu';
@@ -25,6 +26,7 @@ export interface StoredCookieItem {
   path: string;
   expires?: number;
   httpOnly?: boolean;
+  sameSite?: 'Strict' | 'Lax' | 'None';
   secure?: boolean;
 }
 
@@ -41,6 +43,8 @@ export interface PersistedJdSession {
   lastKeepAliveAt?: string;
   keepAliveCount?: number;
   hadValidAuth?: boolean;
+  lastVerifiedAt?: string;
+  authExpiredAt?: string;
   expiredNotifiedAt?: string;
   protocolMeta?: {
     showEndpoint: string;
@@ -65,16 +69,28 @@ interface ActiveJdQrSession {
 }
 
 interface ActiveTaobaoQrSession {
-  t: number;
-  ck: string;
-  codeContent: string;
-  csrf: string;
-  qrImage: string;
-  createdAt: number;
   expiresAt: number;
   lastStatus: 'NEW' | 'SCANED' | 'CONFIRMED' | 'EXPIRED' | 'CANCELED' | 'ERROR';
-  lastMessage: string;
-  redirectUrl?: string;
+}
+
+const accountDomains = {
+  jd: /(?:^|\.)jd\.com$/i,
+  taobao: /(?:^|\.)(?:taobao|tmall)\.com$/i,
+};
+
+const loginPages = {
+  jd: 'https://passport.jd.com/new/login.aspx?ReturnUrl=https%3A%2F%2Fwww.jd.com%2F',
+  taobao: 'https://login.taobao.com/havanaone/login/login.htm?bizName=taobao&sub=true',
+};
+
+function platformUrl(value: string | undefined, platform: Platform, base = loginPages[platform]): URL | null {
+  try {
+    const url = new URL(value || '', base);
+    return url.protocol === 'https:' && !url.username && !url.password && !url.port &&
+      accountDomains[platform].test(url.hostname) ? url : null;
+  } catch {
+    return null;
+  }
 }
 
 const JD_UA =
@@ -85,7 +101,7 @@ const JD_QR_CHECK_URL = 'https://qr.m.jd.com/check';
 const JD_QR_VALIDATE_URL = 'https://passport.jd.com/uc/qrCodeTicketValidation';
 const JD_LOGIN_VERIFY_URL = 'https://passport.jd.com/loginservice.aspx';
 
-const TB_LOGIN_PAGE_URL = 'https://login.taobao.com/havanaone/login/login.htm?bizName=taobao&sub=true';
+const TB_LOGIN_PAGE_URL = loginPages.taobao;
 const TB_QR_GENERATE_URL = 'https://login.taobao.com/havanaone/loginLegacy/qrCode/generate.do';
 const TB_QR_QUERY_URL = 'https://login.taobao.com/havanaone/loginLegacy/qrCode/query.do';
 const TB_SMS_SEND_URL = 'https://login.taobao.com/havanaone/loginLegacy/sms/sendSms.do';
@@ -101,11 +117,11 @@ let headlessAuthLaunching: Promise<BrowserContext> | null = null;
 let headlessLoginPage: Page | null = null;
 
 let activeTaobaoQrSession: ActiveTaobaoQrSession | null = null;
-let headlessTbContext: BrowserContext | null = null;
-let headlessTbLaunching: Promise<BrowserContext> | null = null;
 let headlessTbPage: Page | null = null;
 
 let keepAliveTimer: NodeJS.Timeout | null = null;
+let jdVerification: Promise<JdSessionCheck> | null = null;
+const authVersion: Record<Platform, number> = { jd: 0, taobao: 0 };
 
 /**
  * 统一解析到 Monorepo 根目录下的 .local-data，确保从根目录或 apps/api 启动时读写同一个持久化目录
@@ -176,10 +192,7 @@ export function savePersistedTaobaoSession(
   incoming: Partial<PersistedTaobaoSession> & { cookies: Record<string, string> },
 ): PersistedTaobaoSession {
   const existing = loadPersistedTaobaoSession();
-  const mergedCookies: Record<string, string> = {
-    ...(existing?.cookies || {}),
-    ...incoming.cookies,
-  };
+  const mergedCookies = incoming.cookies;
   const rawNick =
     incoming.nick ||
     decodeCookieValue(mergedCookies.tracknick || mergedCookies._nk_ || mergedCookies.lgc || mergedCookies.dnk) ||
@@ -214,8 +227,7 @@ export function savePersistedTaobaoSession(
   };
 
   const filePath = getTaobaoSessionFilePath();
-  mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
+  writeSessionFile(filePath, session);
   return session;
 }
 
@@ -223,12 +235,11 @@ function getSharedHeadlessProfilePath(): string {
   return join(getDataRoot(), 'PriceDrop', 'browser-profiles', 'shared-headless');
 }
 
-function getTaobaoHeadlessProfilePath(): string {
-  return join(getDataRoot(), 'PriceDrop', 'browser-profiles', 'taobao-headless');
-}
-
-function getJdHeadlessProfilePath(): string {
-  return join(getDataRoot(), 'PriceDrop', 'browser-profiles', 'jd-headless');
+function writeSessionFile(filePath: string, session: PersistedJdSession | PersistedTaobaoSession): void {
+  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+  const temporaryPath = filePath + '.tmp';
+  writeFileSync(temporaryPath, JSON.stringify(session, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  renameSync(temporaryPath, filePath);
 }
 
 function platformOf(value: string): Platform {
@@ -238,10 +249,13 @@ function platformOf(value: string): Platform {
 
 function validateOrigin(req: Request) {
   const origin = req.get('origin');
+  if (req.get('sec-fetch-site') === 'cross-site') {
+    throw new ForbiddenException('请从当前 PricePulse 页面发起请求');
+  }
   if (!origin) return;
   try {
     const parsed = new URL(origin);
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.host !== req.get('host')) {
       throw new ForbiddenException('非法的请求来源协议');
     }
   } catch {
@@ -274,6 +288,11 @@ export function buildCookieHeader(cookies: Record<string, string>): string {
 }
 
 function parseJsonpPayload<T = Record<string, unknown>>(rawText: string): T | null {
+  try {
+    return JSON.parse(rawText) as T;
+  } catch {
+    // Try the JSONP wrapper.
+  }
   const start = rawText.indexOf('(');
   const end = rawText.lastIndexOf(')');
   if (start === -1 || end === -1 || end <= start) return null;
@@ -312,12 +331,8 @@ export function savePersistedJdSession(
   incoming: Partial<PersistedJdSession> & { cookies: Record<string, string> },
 ): PersistedJdSession {
   const existing = loadPersistedJdSession();
-  const mergedCookies: Record<string, string> = {
-    ...(existing?.cookies || {}),
-    ...incoming.cookies,
-  };
+  const mergedCookies = incoming.cookies;
 
-  const hasCoreAuth = Boolean(mergedCookies.thor || mergedCookies.pt_key);
   const rawPin =
     incoming.pin ||
     decodeCookieValue(
@@ -330,7 +345,7 @@ export function savePersistedJdSession(
     '';
   const rawNickname =
     (incoming.nickname && incoming.nickname !== '京东用户' ? incoming.nickname : '') ||
-    decodeCookieValue(mergedCookies.unick || mergedCookies. TrackID) ||
+    decodeCookieValue(mergedCookies.unick) ||
     (existing?.nickname && existing.nickname !== '京东用户' ? existing.nickname : '') ||
     rawPin ||
     '京东用户';
@@ -349,25 +364,29 @@ export function savePersistedJdSession(
     updatedAt: incoming.updatedAt || new Date().toISOString(),
     lastKeepAliveAt: incoming.lastKeepAliveAt || existing?.lastKeepAliveAt || new Date().toISOString(),
     keepAliveCount: incoming.keepAliveCount ?? existing?.keepAliveCount ?? 0,
-    hadValidAuth: hasCoreAuth ? true : (incoming.hadValidAuth ?? existing?.hadValidAuth ?? false),
-    expiredNotifiedAt: hasCoreAuth ? undefined : (incoming.expiredNotifiedAt ?? existing?.expiredNotifiedAt),
+    hadValidAuth: incoming.hadValidAuth ?? existing?.hadValidAuth,
+    lastVerifiedAt: incoming.lastVerifiedAt ?? existing?.lastVerifiedAt,
+    authExpiredAt: incoming.authExpiredAt,
+    expiredNotifiedAt: incoming.expiredNotifiedAt,
     protocolMeta: incoming.protocolMeta || existing?.protocolMeta,
   };
 
   const filePath = getJdSessionFilePath();
-  mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
+  writeSessionFile(filePath, session);
   return session;
 }
 
 export async function verifyJdCookiesWithLoginService(cookieHeader: string): Promise<{
   authenticated: boolean;
+  rejected: boolean;
   pin: string;
   nickname: string;
   refreshedCookies: Record<string, string>;
 }> {
   const refreshedCookies: Record<string, string> = {};
+  if (!cookieHeader) return { authenticated: false, rejected: false, pin: '', nickname: '', refreshedCookies };
   let authenticated = false;
+  let rejected = false;
   let pin = '';
   let nickname = '';
 
@@ -375,6 +394,8 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
     const callback = `jsonpLogin_${Date.now()}`;
     const url = `${JD_LOGIN_VERIFY_URL}?method=Login&callback=${callback}&_=${Date.now()}`;
     const res = await fetch(url, {
+      signal: AbortSignal.timeout(7000),
+      redirect: 'error',
       headers: {
         'User-Agent': JD_UA,
         Referer: 'https://www.jd.com/',
@@ -391,8 +412,9 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
     const parsed = parseJsonpPayload<{
       Identity?: { IsAuthenticated?: boolean; Unick?: string; Name?: string };
     }>(text);
-    const identity = parsed?.Identity;
-    if (identity?.IsAuthenticated) {
+    const identity = res.ok ? parsed?.Identity : undefined;
+    rejected = identity?.IsAuthenticated === false;
+    if (identity?.IsAuthenticated === true) {
       authenticated = true;
       pin = identity.Name || '';
       nickname = identity.Unick || identity.Name || '';
@@ -405,6 +427,8 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
   if (!nickname || nickname === '京东用户' || !authenticated) {
     try {
       const infoRes = await fetch('https://me-api.jd.com/user_new/info/GetJDUserInfoUnion', {
+        signal: AbortSignal.timeout(7000),
+        redirect: 'error',
         headers: {
           'User-Agent': JD_UA,
           Referer: 'https://home.jd.com/',
@@ -443,24 +467,11 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
     }
   }
 
-  return { authenticated, pin, nickname, refreshedCookies };
+  return { authenticated, rejected: rejected && !authenticated, pin, nickname, refreshedCookies };
 }
 
-function cleanStaleChromiumLocks(dir: string) {
-  for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-    try {
-      rmSync(join(dir, lockName), { force: true });
-    } catch {
-      // ignore
-    }
-  }
-}
-
-async function launchStealthPersistentContext(profileDir: string): Promise<BrowserContext> {
+async function launchPersistentContext(profileDir: string): Promise<BrowserContext> {
   mkdirSync(profileDir, { recursive: true });
-  cleanStaleChromiumLocks(profileDir);
-  cleanStaleChromiumLocks(getJdHeadlessProfilePath());
-  cleanStaleChromiumLocks(getTaobaoHeadlessProfilePath());
 
   const isolatedHome = join(profileDir, '.home');
   const isolatedConfig = join(isolatedHome, '.config');
@@ -474,7 +485,6 @@ async function launchStealthPersistentContext(profileDir: string): Promise<Brows
     '--disable-dev-shm-usage',
     '--disable-gpu',
     '--disable-software-rasterizer',
-    '--disable-blink-features=AutomationControlled',
     '--disable-background-networking',
     '--disable-component-update',
     '--disable-sync',
@@ -485,7 +495,7 @@ async function launchStealthPersistentContext(profileDir: string): Promise<Brows
   ];
   const baseOptions = {
     headless: true,
-    userAgent: JD_UA,
+    timeout: 15000,
     viewport: { width: 1280, height: 800 },
     args: launchArgs,
     env: {
@@ -494,17 +504,13 @@ async function launchStealthPersistentContext(profileDir: string): Promise<Brows
       XDG_CONFIG_HOME: isolatedConfig,
       XDG_CACHE_HOME: isolatedCache,
     },
-    extraHTTPHeaders: {
-      'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"macOS"',
-    },
+
   };
 
   let context: BrowserContext | null = null;
   const candidateBins = [
-    '/usr/lib/chromium/chromium',
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    '/usr/lib/chromium/chromium',
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
     '/usr/bin/google-chrome',
@@ -518,7 +524,7 @@ async function launchStealthPersistentContext(profileDir: string): Promise<Brows
       });
       break;
     } catch {
-      cleanStaleChromiumLocks(profileDir);
+      // Try the next available executable.
     }
   }
 
@@ -533,60 +539,35 @@ async function launchStealthPersistentContext(profileDir: string): Promise<Brows
     }
   }
 
-  await context
-    .addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    })
-    .catch(() => {});
-
   return context;
 }
 
-export async function ensureJdContextCookies(context: BrowserContext): Promise<void> {
-  const existing = loadPersistedJdSession();
-  if (!existing) return;
-  try {
-    const entries = Object.entries(existing.cookies).filter(([k, v]) => Boolean(k && v));
-    const toAdd = entries.flatMap(([name, value]) => [
-      { name, value: String(value), domain: '.jd.com', path: '/' },
-      { name, value: String(value), domain: 'item.jd.com', path: '/' },
-      { name, value: String(value), domain: 'passport.jd.com', path: '/' },
-    ]);
-    if (toAdd.length > 0) {
-      await context.addCookies(toAdd);
-    }
-  } catch {
-    // ignore cookie injection warnings
-  }
+async function restorePlatformCookies(context: BrowserContext, platform: Platform): Promise<void> {
+  const saved = platform === 'jd' ? loadPersistedJdSession() : loadPersistedTaobaoSession();
+  if (!saved || ('authExpiredAt' in saved && saved.authExpiredAt)) return;
+
+  const current = await context.cookies();
+  const cookieList = saved.cookieList?.length
+    ? saved.cookieList.filter(cookie => accountDomains[platform].test(cookie.domain))
+    : Object.entries(saved.cookies).map(([name, value]) => ({
+        name, value, domain: platform === 'jd' ? '.jd.com' : '.taobao.com', path: '/',
+        expires: -1, httpOnly: false, secure: true,
+      }));
+  const cookies = cookieList.filter(cookie =>
+    cookie.value &&
+    (!cookie.expires || cookie.expires === -1 || cookie.expires > Date.now() / 1000) &&
+    !current.some(item =>
+      item.name === cookie.name && item.domain === cookie.domain && item.path === cookie.path),
+  );
+  if (cookies.length) await context.addCookies(cookies);
 }
 
-export async function ensureTaobaoContextCookies(context: BrowserContext): Promise<void> {
-  const existing = loadPersistedTaobaoSession();
-  if (!existing) return;
-  try {
-    const entries = Object.entries(existing.cookies).filter(([k, v]) => Boolean(k && v));
-    const toAdd = entries.flatMap(([name, value]) => [
-      { name, value: String(value), domain: '.taobao.com', path: '/' },
-      { name, value: String(value), domain: '.tmall.com', path: '/' },
-    ]);
-    if (existing.cookieList && existing.cookieList.length > 0) {
-      for (const c of existing.cookieList) {
-        if (c.name && c.value) {
-          toAdd.push({
-            name: c.name,
-            value: String(c.value),
-            domain: c.domain || '.taobao.com',
-            path: c.path || '/',
-          });
-        }
-      }
-    }
-    if (toAdd.length > 0) {
-      await context.addCookies(toAdd);
-    }
-  } catch {
-    // ignore cookie injection warnings
-  }
+export function ensureJdContextCookies(context: BrowserContext): Promise<void> {
+  return restorePlatformCookies(context, 'jd');
+}
+
+export function ensureTaobaoContextCookies(context: BrowserContext): Promise<void> {
+  return restorePlatformCookies(context, 'taobao');
 }
 
 /**
@@ -600,16 +581,19 @@ async function getSharedHeadlessContext(): Promise<BrowserContext> {
 
   const task = (async () => {
     const profileDir = getSharedHeadlessProfilePath();
-    const context = await launchStealthPersistentContext(profileDir);
-    await ensureJdContextCookies(context);
-    await ensureTaobaoContextCookies(context);
+    const context = await launchPersistentContext(profileDir);
+    try {
+      await ensureJdContextCookies(context);
+      await ensureTaobaoContextCookies(context);
+    } catch (error) {
+      await context.close().catch(() => {});
+      throw error;
+    }
 
     headlessAuthContext = context;
-    headlessTbContext = context;
     context.on('close', () => {
       if (headlessAuthContext === context) {
         headlessAuthContext = null;
-        headlessTbContext = null;
         headlessLoginPage = null;
         headlessTbPage = null;
       }
@@ -618,19 +602,15 @@ async function getSharedHeadlessContext(): Promise<BrowserContext> {
   })();
 
   headlessAuthLaunching = task;
-  headlessTbLaunching = task;
   try {
     return await task;
   } finally {
     headlessAuthLaunching = null;
-    headlessTbLaunching = null;
   }
 }
 
 export async function getJdHeadlessContext(): Promise<BrowserContext> {
-  const ctx = await getSharedHeadlessContext();
-  await ensureJdContextCookies(ctx);
-  return ctx;
+  return getSharedHeadlessContext();
 }
 
 async function getOrOpenHeadlessJdLoginPage(forceLoginUrl = false): Promise<Page> {
@@ -660,17 +640,10 @@ async function syncCookiesFromHeadlessContext(
   extraCookies: Record<string, string> = {},
   source: 'qrcode' | 'sms' = 'qrcode',
   extraMeta?: { mobile?: string; lastCheckCode?: number; lastValidateReturnCode?: number },
-): Promise<PersistedJdSession> {
+): Promise<PersistedJdSession | null> {
+  const version = authVersion.jd;
   const context = await getJdHeadlessContext();
-  let browserCookies = await context.cookies([
-    'https://www.jd.com',
-    'https://passport.jd.com',
-    'https://item.jd.com',
-    'https://m.jd.com',
-    'https://item.m.jd.com',
-    'https://home.jd.com',
-    'https://aq.jd.com',
-  ]);
+  let browserCookies = (await context.cookies()).filter(cookie => accountDomains.jd.test(cookie.domain));
 
   const initialMap: Record<string, string> = { ...extraCookies };
   for (const c of browserCookies) {
@@ -679,16 +652,18 @@ async function syncCookiesFromHeadlessContext(
     }
   }
 
+  if (!hasJdAuth(initialMap)) return null;
+
   // 如果已经拿到了核心凭证 thor 或 pt_key，但还没有拿到主站 unick / pin 等完整 Cookie，让页面访问一次 www.jd.com 补齐主站 Cookie 与昵称
   let pageNickname = '';
   let pagePin = '';
   if (
-    (initialMap.thor || initialMap.pt_key) &&
-    (!initialMap.unick || !initialMap.pin || Object.keys(initialMap).length < 18)
+    !initialMap.unick || !initialMap.pin
   ) {
     try {
-      const page = headlessLoginPage && !headlessLoginPage.isClosed() ? headlessLoginPage : await context.newPage();
-      if (!page.url().includes('www.jd.com')) {
+      const page = headlessLoginPage;
+      if (!page || page.isClosed()) return null;
+      if (platformUrl(page.url(), 'jd')?.hostname !== 'www.jd.com') {
         await page.goto('https://www.jd.com/', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
         await page.waitForTimeout(1000).catch(() => {});
       }
@@ -700,31 +675,24 @@ async function syncCookiesFromHeadlessContext(
             const r = await fetch('https://passport.jd.com/user/petName/getUserInfoForMiniJd.action', {
               credentials: 'include',
               headers: { 'X-Requested-With': 'XMLHttpRequest' },
+              signal: AbortSignal.timeout(3500),
             });
-            const j = (await r.json()) as { nickName?: string; realName?: string; pin?: string };
-            nick = j?.nickName || j?.realName || '';
+            const j = (await r.json()) as { nickName?: string; pin?: string };
+            nick = j?.nickName || '';
             uPin = j?.pin || '';
           } catch {
             // ignore
           }
           if (!nick) {
             const el = document.querySelector('.nickname, #ttbar-login .link-user, .user-name') as HTMLElement | null;
-            if (el?.textContent) nick = el.textContent.trim();
+            if (el?.textContent && !/登录|注册/.test(el.textContent)) nick = el.textContent.trim();
           }
           return { nick, uPin };
         })
         .catch(() => ({ nick: '', uPin: '' }));
       pageNickname = domUser.nick;
       pagePin = domUser.uPin;
-      browserCookies = await context.cookies([
-        'https://www.jd.com',
-        'https://passport.jd.com',
-        'https://item.jd.com',
-        'https://m.jd.com',
-        'https://item.m.jd.com',
-        'https://home.jd.com',
-        'https://aq.jd.com',
-      ]);
+      browserCookies = (await context.cookies()).filter(cookie => accountDomains.jd.test(cookie.domain));
     } catch {
       // ignore
     }
@@ -744,12 +712,15 @@ async function syncCookiesFromHeadlessContext(
         expires: c.expires,
         httpOnly: c.httpOnly,
         secure: c.secure,
+        sameSite: c.sameSite,
       });
     }
   }
 
   const header = buildCookieHeader(cookieMap);
   const verified = await verifyJdCookiesWithLoginService(header);
+  if (!verified.authenticated || version !== authVersion.jd) return null;
+  const verifiedAt = new Date().toISOString();
   Object.assign(cookieMap, verified.refreshedCookies);
 
   const pin =
@@ -759,9 +730,10 @@ async function syncCookiesFromHeadlessContext(
     extraMeta?.mobile ||
     '';
   const nickname =
-    verified.nickname ||
+    (verified.nickname && verified.nickname !== verified.pin ? verified.nickname : '') ||
     pageNickname ||
     decodeCookieValue(cookieMap.unick) ||
+    verified.nickname ||
     pin ||
     '京东用户';
 
@@ -772,8 +744,11 @@ async function syncCookiesFromHeadlessContext(
     cookies: cookieMap,
     cookieList,
     source,
-    updatedAt: new Date().toISOString(),
-    lastKeepAliveAt: new Date().toISOString(),
+    updatedAt: verifiedAt,
+    lastKeepAliveAt: verifiedAt,
+    lastVerifiedAt: verifiedAt,
+    hadValidAuth: true,
+    keepAliveCount: 0,
     protocolMeta: {
       showEndpoint: JD_QR_SHOW_URL,
       checkEndpoint: JD_QR_CHECK_URL,
@@ -785,89 +760,92 @@ async function syncCookiesFromHeadlessContext(
   });
 }
 
-/**
- * 服务端定时保活任务：定期刷新京东会话状态并合并最新 Set-Cookie，防止长期放置后过期
- */
-export async function runJdSessionKeepAlive(): Promise<{
-  ok: boolean;
+type JdSessionCheck = {
+  state: 'logged_in' | 'login_required' | 'unverified';
   session: PersistedJdSession | null;
   message: string;
-}> {
+};
+
+async function checkPersistedJdSession(): Promise<JdSessionCheck> {
   const session = loadPersistedJdSession();
-  if (!session) {
-    return { ok: false, session: null, message: '尚未保存京东登录态' };
+  const version = authVersion.jd;
+  if (!session || !hasJdAuth(session.cookies)) {
+    return { state: 'login_required', session: null, message: '请完成京东登录与平台安全验证' };
+  }
+  if (session.authExpiredAt) {
+    return { state: 'login_required', session: null, message: '京东已确认会话失效，请重新登录' };
   }
 
   const verified = await verifyJdCookiesWithLoginService(session.cookieHeader);
-  const mergedCookies = {
-    ...session.cookies,
-    ...verified.refreshedCookies,
-  };
-
-  try {
-    const homeRes = await fetch('https://www.jd.com/', {
-      headers: {
-        'User-Agent': JD_UA,
-        Cookie: buildCookieHeader(mergedCookies),
-      },
+  if (version !== authVersion.jd || loadPersistedJdSession()?.updatedAt !== session.updatedAt) {
+    return { state: 'unverified', session: null, message: '京东会话已变更，请刷新状态' };
+  }
+  if (verified.authenticated) {
+    const now = new Date().toISOString();
+    const updated = savePersistedJdSession({
+      ...session,
+      pin: verified.pin || session.pin,
+      nickname: verified.nickname || session.nickname,
+      cookies: { ...session.cookies, ...verified.refreshedCookies },
+      hadValidAuth: true,
+      lastVerifiedAt: now,
+      lastKeepAliveAt: now,
+      keepAliveCount: (session.keepAliveCount ?? 0) + 1,
     });
-    const setCookies =
-      typeof homeRes.headers.getSetCookie === 'function'
-        ? homeRes.headers.getSetCookie()
-        : [homeRes.headers.get('set-cookie') || ''].filter(Boolean);
-    Object.assign(mergedCookies, parseSetCookieHeaders(setCookies));
-  } catch {
-    // ignore transient network failure
+    return { state: 'logged_in', session: updated, message: `京东会话已验证（账号：${updated.nickname}）` };
+  }
+  if (!verified.rejected) {
+    return { state: 'unverified', session, message: '暂时无法向京东确认登录状态，已保留会话，稍后可重试' };
   }
 
-  // 保活时绝不删除已有的核心登录 Cookie (thor / pt_key / pin / unick)
-  if (session.cookies.thor && !mergedCookies.thor) mergedCookies.thor = session.cookies.thor;
-  if (session.cookies.pt_key && !mergedCookies.pt_key) mergedCookies.pt_key = session.cookies.pt_key;
-  if (session.cookies.pin && !mergedCookies.pin) mergedCookies.pin = session.cookies.pin;
-  if (session.cookies.unick && !mergedCookies.unick) mergedCookies.unick = session.cookies.unick;
-
-  const updated = savePersistedJdSession({
+  const expiredAt = new Date().toISOString();
+  const shouldNotify = Boolean(session.lastVerifiedAt && !session.expiredNotifiedAt);
+  savePersistedJdSession({
     ...session,
-    pin: verified.pin || session.pin,
-    nickname: verified.nickname || session.nickname,
-    cookies: mergedCookies,
-    updatedAt: session.updatedAt,
-    lastKeepAliveAt: new Date().toISOString(),
-    keepAliveCount: (session.keepAliveCount ?? 0) + 1,
+    authExpiredAt: expiredAt,
+    expiredNotifiedAt: shouldNotify ? expiredAt : session.expiredNotifiedAt,
   });
+  if (shouldNotify) {
+    void notifySessionExpiredToFeishu('jd', '京东已确认保存的会话失效，请重新登录').catch(() => {});
+  }
+  return { state: 'login_required', session: null, message: '京东已确认会话失效，请重新登录' };
+}
 
-  return {
-    ok: true,
-    session: updated,
-    message: `服务端保活完成（账号：${updated.nickname}，累计保活 ${updated.keepAliveCount} 次）`,
-  };
+function hasJdAuth(cookies: Record<string, string>): boolean {
+  return Boolean(cookies.thor || (cookies.pt_key && cookies.pt_pin));
+}
+
+function hasTaobaoAuth(cookies: Record<string, string>): boolean {
+  const auth = [cookies.cookie2, cookies.uc3, cookies.sgcookie].some(value => value && value !== 'deleted');
+  const identity = [cookies.unb, cookies.tracknick, cookies._nk_].some(value => value && value !== 'deleted');
+  return auth && identity;
+}
+
+export async function runJdSessionKeepAlive(): Promise<JdSessionCheck> {
+  if (jdVerification) return jdVerification;
+  jdVerification = checkPersistedJdSession();
+  try {
+    return await jdVerification;
+  } finally {
+    jdVerification = null;
+  }
 }
 
 /**
  * 获取淘宝服务端常驻无头浏览器上下文（与京东共用全局单例 Chromium 上下文）
  */
 export async function getTaobaoHeadlessContext(): Promise<BrowserContext> {
-  const ctx = await getSharedHeadlessContext();
-  await ensureTaobaoContextCookies(ctx);
-  return ctx;
+  return getSharedHeadlessContext();
 }
 
 async function syncTaobaoCookiesFromHeadlessContext(
   extraCookies: Record<string, string> = {},
   source: 'qrcode' | 'sms' = 'qrcode',
   mobile?: string,
-): Promise<PersistedTaobaoSession> {
+): Promise<PersistedTaobaoSession | null> {
+  const version = authVersion.taobao;
   const context = await getTaobaoHeadlessContext();
-  const browserCookies = await context.cookies([
-    'https://www.taobao.com',
-    'https://www.tmall.com',
-    'https://detail.tmall.com',
-    'https://item.taobao.com',
-    'https://login.taobao.com',
-    'https://i.taobao.com',
-    'https://h5api.m.taobao.com',
-    'https://h5api.m.tmall.com',
-  ]);
+  const browserCookies = (await context.cookies()).filter(cookie => accountDomains.taobao.test(cookie.domain));
   const cookieMap: Record<string, string> = { ...extraCookies };
   const cookieList: StoredCookieItem[] = [];
 
@@ -882,10 +860,12 @@ async function syncTaobaoCookiesFromHeadlessContext(
         expires: c.expires,
         httpOnly: c.httpOnly,
         secure: c.secure,
+        sameSite: c.sameSite,
       });
     }
   }
 
+  if (!hasTaobaoAuth(cookieMap) || version !== authVersion.taobao) return null;
   return savePersistedTaobaoSession({
     cookies: cookieMap,
     cookieList,
@@ -975,8 +955,8 @@ export class SessionsController implements OnModuleInit {
     if (!keepAliveTimer) {
       // 每 10 分钟在服务端后台执行一次京东与淘宝登录态保活心跳
       keepAliveTimer = setInterval(() => {
-        void runJdSessionKeepAlive();
-        void runTaobaoSessionKeepAlive();
+        void runJdSessionKeepAlive().catch(() => {});
+        void runTaobaoSessionKeepAlive().catch(() => {});
       }, 10 * 60 * 1000);
       keepAliveTimer.unref?.();
     }
@@ -984,39 +964,20 @@ export class SessionsController implements OnModuleInit {
 
   private async getOrCreateRemotePage(
     platform: Platform,
-    options?: { targetUrl?: string; keepCurrent?: boolean },
+    options?: { keepCurrent?: boolean },
   ): Promise<Page> {
-    if (platform === 'jd') {
-      const context = await getJdHeadlessContext();
-      if (!headlessLoginPage || headlessLoginPage.isClosed()) {
-        headlessLoginPage = await context.newPage();
-        await headlessLoginPage.setViewportSize({ width: 1280, height: 800 }).catch(() => {});
-      }
-      const curUrl = headlessLoginPage.url();
-      const target = options?.targetUrl || `${JD_LOGIN_PAGE_URL}?ReturnUrl=${encodeURIComponent('https://www.jd.com/')}`;
-      if (options?.targetUrl || curUrl === 'about:blank' || (!options?.keepCurrent && !curUrl.includes('jd.com'))) {
-        await headlessLoginPage.goto(target, { waitUntil: 'domcontentloaded', timeout: 22000 }).catch(() => {});
-        await headlessLoginPage.waitForTimeout(500).catch(() => {});
-      }
-      return headlessLoginPage;
+    const context = await getSharedHeadlessContext();
+    let page = platform === 'jd' ? headlessLoginPage : headlessTbPage;
+    if (!page || page.isClosed()) {
+      page = await context.newPage();
+      if (platform === 'jd') headlessLoginPage = page;
+      else headlessTbPage = page;
     }
-
-    const context = await getTaobaoHeadlessContext();
-    if (!headlessTbPage || headlessTbPage.isClosed()) {
-      headlessTbPage = await context.newPage();
-      await headlessTbPage.setViewportSize({ width: 1280, height: 800 }).catch(() => {});
+    if (!options?.keepCurrent || !platformUrl(page.url(), platform)) {
+      await page.goto(loginPages[platform], { waitUntil: 'domcontentloaded', timeout: 15000 })
+        .catch(() => {});
     }
-    const curUrl = headlessTbPage.url();
-    const target = options?.targetUrl || TB_LOGIN_PAGE_URL;
-    if (
-      options?.targetUrl ||
-      curUrl === 'about:blank' ||
-      (!options?.keepCurrent && !curUrl.includes('taobao.com') && !curUrl.includes('tmall.com'))
-    ) {
-      await headlessTbPage.goto(target, { waitUntil: 'domcontentloaded', timeout: 22000 }).catch(() => {});
-      await headlessTbPage.waitForTimeout(500).catch(() => {});
-    }
-    return headlessTbPage;
+    return page;
   }
 
   private async captureRemoteFrameAndCheckAuth(
@@ -1025,80 +986,45 @@ export class SessionsController implements OnModuleInit {
     mobile?: string,
   ) {
     const page = await this.getOrCreateRemotePage(platform, { keepCurrent: true });
-    const context = await getSharedHeadlessContext();
-    const curUrl = page.url();
-
-    if (platform === 'jd') {
-      const jdCookies = await context.cookies([
-        'https://www.jd.com',
-        'https://passport.jd.com',
-        'https://m.jd.com',
-        'https://home.jd.com',
-      ]);
-      const hasCore = jdCookies.some(c => (c.name === 'thor' || c.name === 'pt_key') && c.value && c.value !== 'deleted');
-      const isOnVerifyOrLogin =
-        curUrl.includes('aq.jd.com') ||
-        curUrl.includes('safe.jd.com') ||
-        curUrl.includes('cfe.m.jd.com');
-
-      if (hasCore && !isOnVerifyOrLogin) {
-        const saved = await syncCookiesFromHeadlessContext({}, source, { mobile });
+    const url = platformUrl(page.url(), platform);
+    const host = url?.hostname;
+    const onJdChallenge = host === 'aq.jd.com' || host === 'safe.jd.com' || host === 'cfe.m.jd.com';
+    if (platform === 'jd' && host && !onJdChallenge) {
+      const saved = await syncCookiesFromHeadlessContext({}, source, { mobile });
+      if (saved) {
         activeJdQrSession = null;
-        return {
-          state: 'logged_in',
-          code: 200,
-          nickname: saved.nickname,
-          pin: saved.pin,
-          mobile: saved.mobile,
-          source: saved.source,
-          updatedAt: saved.updatedAt,
-          lastKeepAliveAt: saved.lastKeepAliveAt,
-          cookieCount: Object.keys(saved.cookies).length,
-          storagePath: getJdSessionFilePath(),
-          message: `京东验证与登录已完成（账号：${saved.nickname}，共 ${Object.keys(saved.cookies).length} 项 Cookie 已持久保存）`,
-        };
+        return this.jdSessionResponse({
+          state: 'logged_in', session: saved, message: `京东登录成功（账号：${saved.nickname}）`,
+        });
       }
-    } else {
-      const tbCookies = await context.cookies([
-        'https://www.taobao.com',
-        'https://www.tmall.com',
-        'https://login.taobao.com',
-      ]);
-      const hasCore = tbCookies.some(
-        c => (c.name === 'uc3' || c.name === 'sgcookie' || c.name === 'cookie17') && c.value && c.value !== 'deleted',
-      );
-      const leftLogin =
-        curUrl !== 'about:blank' &&
-        !curUrl.includes('login.taobao.com') &&
-        !curUrl.includes('login.m.taobao.com') &&
-        (curUrl.includes('taobao.com') || curUrl.includes('tmall.com'));
+    }
 
-      if (hasCore && leftLogin) {
-        const saved = await syncTaobaoCookiesFromHeadlessContext({}, source, mobile);
+    if (platform === 'taobao' && host && !/^login\./.test(host) && host !== 'login.m.taobao.com') {
+      const saved = await syncTaobaoCookiesFromHeadlessContext({}, source, mobile);
+      if (saved) {
         activeTaobaoQrSession = null;
         return {
           state: 'logged_in',
           code: 200,
           nickname: saved.nick,
           pin: saved.uid,
-          mobile: saved.mobile,
           source: saved.source,
           updatedAt: saved.updatedAt,
           lastKeepAliveAt: saved.lastKeepAliveAt,
           cookieCount: Object.keys(saved.cookies).length,
           storagePath: getTaobaoSessionFilePath(),
-          message: `淘宝验证与登录已完成（账号：${saved.nick}，共 ${Object.keys(saved.cookies).length} 项 Cookie 已持久保存）`,
+          message: `淘宝登录成功（账号：${saved.nick}）`,
         };
       }
     }
 
-    const buf = await page.screenshot({ type: 'jpeg', quality: 78 }).catch(() => null);
+    const buf = url ? await page.screenshot({ type: 'jpeg', quality: 78, timeout: 3500 }).catch(() => null) : null;
     const screenshot = buf ? `data:image/jpeg;base64,${buf.toString('base64')}` : '';
-    const title = await page.title().catch(() => '');
+    const title = url ? await page.title().catch(() => '') : '';
 
     return {
       state: 'verify_required',
-      url: curUrl,
+      url: url ? url.origin + url.pathname : '',
       title,
       screenshot,
       viewport: { width: 1280, height: 800 },
@@ -1115,13 +1041,13 @@ export class SessionsController implements OnModuleInit {
   @Post(':platform/remote/start')
   async startRemoteBrowser(
     @Param('platform') input: string,
-    @Body() body: { targetUrl?: string; keepCurrent?: boolean },
+    @Body() body: { keepCurrent?: boolean; targetUrl?: never },
     @Req() req: Request,
   ) {
     validateOrigin(req);
     const platform = platformOf(input);
+    if (body?.targetUrl !== undefined) throw new BadRequestException('只支持平台官方登录页');
     await this.getOrCreateRemotePage(platform, {
-      targetUrl: body?.targetUrl,
       keepCurrent: body?.keepCurrent ?? true,
     });
     return this.captureRemoteFrameAndCheckAuth(platform);
@@ -1131,6 +1057,7 @@ export class SessionsController implements OnModuleInit {
    * 0b. 获取云端实时浏览器最新画面帧并自动检测是否已完成验证/登录
    */
   @Get(':platform/remote/frame')
+  @Header('Cache-Control', 'no-store')
   async getRemoteBrowserFrame(@Param('platform') input: string, @Req() req: Request) {
     validateOrigin(req);
     const platform = platformOf(input);
@@ -1145,7 +1072,7 @@ export class SessionsController implements OnModuleInit {
     @Param('platform') input: string,
     @Body()
     body: {
-      type: 'click' | 'drag' | 'type' | 'key' | 'scroll' | 'reload' | 'goto';
+      type: 'click' | 'drag' | 'type' | 'key' | 'scroll' | 'reload';
       x?: number;
       y?: number;
       fromX?: number;
@@ -1157,13 +1084,16 @@ export class SessionsController implements OnModuleInit {
       key?: string;
       deltaX?: number;
       deltaY?: number;
-      url?: string;
     },
     @Req() req: Request,
   ) {
     validateOrigin(req);
     const platform = platformOf(input);
+    if (!['click', 'drag', 'type', 'key', 'scroll', 'reload'].includes(body?.type)) {
+      throw new BadRequestException('不支持的浏览器操作');
+    }
     const page = await this.getOrCreateRemotePage(platform, { keepCurrent: true });
+    if (!platformUrl(page.url(), platform)) throw new BadRequestException('平台登录页尚未就绪');
 
     try {
       switch (body.type) {
@@ -1174,53 +1104,30 @@ export class SessionsController implements OnModuleInit {
           break;
         }
         case 'drag': {
-          const pts =
-            Array.isArray(body.path) && body.path.length >= 2
-              ? body.path
-              : [
-                  { x: Number(body.fromX) || 0, y: Number(body.fromY) || 0 },
-                  { x: Number(body.toX) || 0, y: Number(body.toY) || 0 },
-                ];
-          const first = pts[0];
-          const startX = Math.max(0, Math.min(1280, Math.round(first.x)));
-          const startY = Math.max(0, Math.min(800, Math.round(first.y)));
-          await page.mouse.move(startX, startY);
-          await page.waitForTimeout(40);
+          const points = Array.isArray(body.path) && body.path.length >= 2
+            ? body.path.slice(0, 200)
+            : [{ x: body.fromX, y: body.fromY }, { x: body.toX, y: body.toY }];
+          const locations = points.map(point => ({
+            x: Math.max(0, Math.min(1280, Number(point?.x) || 0)),
+            y: Math.max(0, Math.min(800, Number(point?.y) || 0)),
+          }));
+          await page.mouse.move(locations[0].x, locations[0].y);
           await page.mouse.down();
-          await page.waitForTimeout(50);
-
-          if (pts.length > 2) {
-            for (let i = 1; i < pts.length; i++) {
-              const px = Math.max(0, Math.min(1280, Math.round(pts[i].x)));
-              const py = Math.max(0, Math.min(800, Math.round(pts[i].y)));
-              await page.mouse.move(px, py, { steps: 2 });
-              await page.waitForTimeout(12);
-            }
-          } else {
-            const end = pts[pts.length - 1];
-            const endX = Math.max(0, Math.min(1280, Math.round(end.x)));
-            const endY = Math.max(0, Math.min(800, Math.round(end.y)));
-            const steps = 18;
-            for (let s = 1; s <= steps; s++) {
-              const progress = 1 - Math.pow(1 - s / steps, 2.2);
-              const curX = Math.round(startX + (endX - startX) * progress);
-              const curY = Math.round(startY + (endY - startY) * progress + Math.sin(s * 0.5) * 1.5);
-              await page.mouse.move(curX, curY);
-              await page.waitForTimeout(14);
-            }
+          try {
+            for (const point of locations.slice(1)) await page.mouse.move(point.x, point.y);
+          } finally {
+            await page.mouse.up();
           }
-          await page.waitForTimeout(60);
-          await page.mouse.up();
           break;
         }
         case 'type': {
-          if (body.text) {
-            await page.keyboard.type(String(body.text), { delay: 30 });
+          if (typeof body.text === 'string') {
+            await page.keyboard.insertText(body.text.slice(0, 256));
           }
           break;
         }
         case 'key': {
-          if (body.key) {
+          if (body.key && ['Backspace', 'Enter', 'Tab', 'Escape'].includes(body.key)) {
             await page.keyboard.press(String(body.key));
           }
           break;
@@ -1233,12 +1140,7 @@ export class SessionsController implements OnModuleInit {
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 18000 }).catch(() => {});
           break;
         }
-        case 'goto': {
-          if (body.url) {
-            await page.goto(String(body.url), { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-          }
-          break;
-        }
+
       }
     } catch {
       // ignore single interaction error and still return updated frame
@@ -1298,6 +1200,8 @@ export class SessionsController implements OnModuleInit {
 
     if (!token || !qrCodeKey || !qrImage) {
       const res = await fetch(showUrl, {
+        signal: AbortSignal.timeout(10000),
+        redirect: 'error',
         headers: {
           'User-Agent': JD_UA,
           Referer: JD_LOGIN_PAGE_URL,
@@ -1366,10 +1270,24 @@ export class SessionsController implements OnModuleInit {
    * 当 code === 200 时，在服务端无头上下文内完成 h5st 签名与 Ticket 校验；
    * 若触发异地/新设备安全验证 (returnCode === 58 / aq.jd.com)，自动返回 verify_required 与实时浏览器验证画面，绝不伪造“京东用户 (12项Cookie)”假登录态
    */
+  private pendingJdQrCheck: Promise<unknown> | null = null;
+
   @Get('jd/qrcode/status')
+  @Header('Cache-Control', 'no-store')
   async checkJdQrStatus(@Req() req: Request) {
     validateOrigin(req);
-    if (!activeJdQrSession) {
+    if (this.pendingJdQrCheck) return this.pendingJdQrCheck;
+    this.pendingJdQrCheck = this.executeJdQrCheck();
+    try {
+      return await this.pendingJdQrCheck;
+    } finally {
+      this.pendingJdQrCheck = null;
+    }
+  }
+
+  private async executeJdQrCheck() {
+    const attempt = activeJdQrSession;
+    if (!attempt) {
       return {
         state: 'qr_none',
         code: 0,
@@ -1377,7 +1295,7 @@ export class SessionsController implements OnModuleInit {
       };
     }
 
-    if (Date.now() > activeJdQrSession.expiresAt) {
+    if (Date.now() > attempt.expiresAt) {
       return {
         state: 'qr_expired',
         code: 203,
@@ -1387,14 +1305,16 @@ export class SessionsController implements OnModuleInit {
 
     const callback = `jQuery${Math.floor(1_000_000 + Math.random() * 9_000_000)}`;
     const checkUrl = `${JD_QR_CHECK_URL}?callback=${callback}&appid=133&token=${encodeURIComponent(
-      activeJdQrSession.token,
+      attempt.token,
     )}&_=${Date.now()}`;
 
     const checkRes = await fetch(checkUrl, {
+      signal: AbortSignal.timeout(7000),
+      redirect: 'error',
       headers: {
         'User-Agent': JD_UA,
         Referer: JD_LOGIN_PAGE_URL,
-        Cookie: buildCookieHeader(activeJdQrSession.cookies),
+        Cookie: buildCookieHeader(attempt.cookies),
       },
     });
 
@@ -1403,34 +1323,32 @@ export class SessionsController implements OnModuleInit {
       typeof checkRes.headers.getSetCookie === 'function'
         ? checkRes.headers.getSetCookie()
         : [checkRes.headers.get('set-cookie') || ''].filter(Boolean);
-    Object.assign(activeJdQrSession.cookies, parseSetCookieHeaders(checkSetCookies));
+    if (activeJdQrSession !== attempt) return { state: 'qr_none', message: '扫码会话已变更' };
+    Object.assign(attempt.cookies, parseSetCookieHeaders(checkSetCookies));
 
     const payload = parseJsonpPayload<{ code?: number; msg?: string; ticket?: string }>(rawText);
     if (!payload || typeof payload.code !== 'number') {
       return {
         state: 'qr_error',
         code: -1,
-        rawText,
         message: '解析京东扫码状态响应失败',
       };
     }
 
-    activeJdQrSession.lastCode = payload.code;
-    activeJdQrSession.lastMessage = payload.msg || '';
+    attempt.lastCode = payload.code;
+    attempt.lastMessage = payload.msg || '';
 
     switch (payload.code) {
       case 201:
         return {
           state: 'qr_waiting',
           code: 201,
-          raw: payload,
           message: payload.msg || '等待扫码（请打开手机京东 App 扫一扫）',
         };
       case 202:
         return {
           state: 'qr_scanned',
           code: 202,
-          raw: payload,
           message: payload.msg || '扫描成功！请在手机京东 App 上点击「确认登录」',
         };
       case 203:
@@ -1438,14 +1356,12 @@ export class SessionsController implements OnModuleInit {
         return {
           state: 'qr_expired',
           code: payload.code,
-          raw: payload,
           message: payload.msg || '二维码已失效，请点击刷新二维码',
         };
       case 205:
         return {
           state: 'qr_cancelled',
           code: 205,
-          raw: payload,
           message: payload.msg || '已在手机端取消二维码登录',
         };
       case 200: {
@@ -1454,13 +1370,12 @@ export class SessionsController implements OnModuleInit {
           return {
             state: 'qr_error',
             code: 200,
-            raw: payload,
-            message: '扫码已确认，但未获取到登录 ticket',
+                  message: '扫码已确认，但未获取到登录 ticket',
           };
         }
 
-        activeJdQrSession.ticket = ticket;
-        const qrCookiesSnapshot = { ...activeJdQrSession.cookies };
+        attempt.ticket = ticket;
+        const qrCookiesSnapshot = { ...attempt.cookies };
         let valJson: { returnCode?: number; url?: string } = {};
 
         try {
@@ -1503,20 +1418,14 @@ export class SessionsController implements OnModuleInit {
             });
             const r = await fetch(`/uc/qrCodeTicketValidation?${qs.toString()}`, {
               credentials: 'include',
+              signal: AbortSignal.timeout(10000),
               headers: { 'X-Requested-With': 'XMLHttpRequest' },
             });
             return (await r.json()) as { returnCode?: number; url?: string };
           }, ticket);
 
-          if (valJson.url) {
-            const targetUrl = valJson.url.startsWith('//')
-              ? `https:${valJson.url}`
-              : valJson.url.startsWith('/')
-                ? `https://passport.jd.com${valJson.url}`
-                : valJson.url;
-            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 16000 }).catch(() => {});
-            await page.waitForTimeout(1000).catch(() => {});
-          }
+          const targetUrl = valJson.url && platformUrl(valJson.url, 'jd');
+          if (targetUrl) await page.goto(targetUrl.href, { waitUntil: 'domcontentloaded', timeout: 16000 }).catch(() => {});
         } catch {
           // ignore headless ticket validation error, will run direct validation below
         }
@@ -1527,6 +1436,8 @@ export class SessionsController implements OnModuleInit {
               ticket,
             )}&pageSource=commonLogin&pageLocation=&ReturnUrl=${encodeURIComponent('https://www.jd.com/')}`;
             const valRes = await fetch(validateUrl, {
+              signal: AbortSignal.timeout(10000),
+              redirect: 'error',
               headers: {
                 'User-Agent': JD_UA,
                 Referer: JD_LOGIN_PAGE_URL,
@@ -1557,15 +1468,11 @@ export class SessionsController implements OnModuleInit {
               )
               .catch(() => {});
 
-            if (valJson.url && headlessLoginPage && !headlessLoginPage.isClosed()) {
-              const targetUrl = valJson.url.startsWith('//')
-                ? `https:${valJson.url}`
-                : valJson.url.startsWith('/')
-                  ? `https://passport.jd.com${valJson.url}`
-                  : valJson.url;
-              await headlessLoginPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 16000 }).catch(() => {});
-              await headlessLoginPage.waitForTimeout(1000).catch(() => {});
+            const targetUrl = valJson.url && platformUrl(valJson.url, 'jd');
+            if (targetUrl && headlessLoginPage && !headlessLoginPage.isClosed()) {
+              await headlessLoginPage.goto(targetUrl.href, { waitUntil: 'domcontentloaded', timeout: 16000 }).catch(() => {});
             }
+
           } catch {
             // ignore fallback network error
           }
@@ -1582,7 +1489,8 @@ export class SessionsController implements OnModuleInit {
           Boolean(qrCookiesSnapshot.thor || qrCookiesSnapshot.pt_key) ||
           currentBrowserCookies.some(c => (c.name === 'thor' || c.name === 'pt_key') && c.value && c.value !== 'deleted');
 
-        if (!hasCoreAuth) {
+        if (activeJdQrSession !== attempt) return { state: 'qr_none', message: '扫码会话已变更' };
+        if (!hasCoreAuth || valJson.returnCode === 58) {
           activeJdQrSession = null;
           const frame = await this.captureRemoteFrameAndCheckAuth('jd', 'qrcode');
           if (frame.state === 'logged_in') {
@@ -1591,9 +1499,10 @@ export class SessionsController implements OnModuleInit {
           return {
             ...frame,
             state: 'verify_required',
-            code: valJson.returnCode ?? 58,
-            message:
-              '扫码已确认，京东触发异地/服务器新设备安全验证 (aq.jd.com)，已为您自动打开下方云端实时验证画面，请直接在画面中完成验证后自动同步完整登录态',
+            code: valJson.returnCode,
+            message: valJson.returnCode === 58
+              ? '京东要求完成新设备安全验证，请在下方官方页面按提示操作'
+              : '扫码已确认，京东尚未完成登录，请检查下方官方页面',
           };
         }
 
@@ -1602,7 +1511,10 @@ export class SessionsController implements OnModuleInit {
           lastValidateReturnCode: valJson.returnCode ?? 0,
         });
 
+        if (activeJdQrSession !== attempt) return { state: 'qr_none', message: '扫码会话已变更' };
         activeJdQrSession = null;
+
+        if (!saved) return this.captureRemoteFrameAndCheckAuth('jd');
 
         return {
           state: 'logged_in',
@@ -1614,10 +1526,6 @@ export class SessionsController implements OnModuleInit {
           lastKeepAliveAt: saved.lastKeepAliveAt,
           cookieCount: Object.keys(saved.cookies).length,
           storagePath: getJdSessionFilePath(),
-          raw: {
-            check: payload,
-            validation: valJson,
-          },
           message: `京东扫码登录成功（账号：${saved.nickname}，共 ${Object.keys(saved.cookies).length} 项 Cookie），登录态已长期保存在服务端`,
         };
       }
@@ -1625,7 +1533,6 @@ export class SessionsController implements OnModuleInit {
         return {
           state: 'qr_error',
           code: payload.code,
-          raw: payload,
           message: payload.msg || `二维码状态异常 (code: ${payload.code})`,
         };
     }
@@ -1643,13 +1550,14 @@ export class SessionsController implements OnModuleInit {
       throw new BadRequestException('请输入有效的 11 位中国大陆手机号码');
     }
 
+    activeJdQrSession = null;
     const page = await getOrOpenHeadlessJdLoginPage(true);
 
     // 切换到短信登录视图并填入手机号
     await page
       .evaluate(() => {
         const tabs = Array.from(document.querySelectorAll('a, div, span, li'));
-        const smsTab = tabs.find(el => {
+        const smsTab = (document.querySelector('#sms-login') as HTMLElement | null) || tabs.find(el => {
           const t = (el.textContent || '').trim();
           return t === '短信登录' || t === '手机验证码登录' || t === '验证码登录';
         }) as HTMLElement | undefined;
@@ -1671,8 +1579,8 @@ export class SessionsController implements OnModuleInit {
       })
       .catch(() => {});
 
-    const mobileSelector = '#mobile-number, input[placeholder*="手机号"], input[name="mobile"]';
-    await page.fill(mobileSelector, mobile).catch(async () => {
+    const mobileSelector = '#mobile-number:visible, input[placeholder="请输入手机号"]:visible, input[name="mobile"]:visible';
+    await page.locator(mobileSelector).first().fill(mobile, { timeout: 3000 }).catch(async () => {
       await page
         .evaluate((phone: string) => {
           const inp = document.querySelector('#mobile-number') as HTMLInputElement | null;
@@ -1693,9 +1601,9 @@ export class SessionsController implements OnModuleInit {
         if (agree && !agree.checked) agree.click();
 
         const sendBtn =
-          (document.querySelector('#sendMobileCode, .msg-btn, .get-code-btn') as HTMLElement | null) ||
+          (document.querySelector('#send-sms-code-btn, #sendMobileCode, .msg-btn, .get-code-btn') as HTMLElement | null) ||
           (Array.from(document.querySelectorAll('button, a, div, span')).find(
-            el => (el.textContent || '').trim() === '获取验证码',
+            el => (el.textContent || '').trim() === '获取验证码' && (el as HTMLElement).offsetWidth > 0,
           ) as HTMLElement | undefined);
         if (sendBtn) sendBtn.click();
       })
@@ -1717,6 +1625,7 @@ export class SessionsController implements OnModuleInit {
 
     // 若触发了人机验证弹窗（JDJRV 滑块/图形点选）或需在页面确认，自动返回实时浏览器画面让用户直接在网页完成验证
     const frame = await this.captureRemoteFrameAndCheckAuth('jd', 'sms', mobile);
+    if (frame.state === 'logged_in') return frame;
     return {
       ...frame,
       ok: false,
@@ -1757,7 +1666,7 @@ export class SessionsController implements OnModuleInit {
             mInput.dispatchEvent(new Event('input', { bubbles: true }));
           }
           const cInput = document.querySelector(
-            '#mobile-code, #authcode, input[placeholder*="验证码"]',
+            '#sms-login-form #sms-code, #sms-login-form #mobile-code, #sms-login-form input[placeholder*="验证码"]',
           ) as HTMLInputElement | null;
           if (cInput) {
             cInput.value = smsCode;
@@ -1768,7 +1677,7 @@ export class SessionsController implements OnModuleInit {
           if (agree && !agree.checked) agree.click();
 
           const loginBtn = document.querySelector(
-            '#sms-login-submit, #loginsubmit, .btn-img.btn-entry',
+            '#sms-login-submit',
           ) as HTMLElement | null;
           if (loginBtn) loginBtn.click();
         },
@@ -1777,80 +1686,6 @@ export class SessionsController implements OnModuleInit {
       .catch(() => {});
 
     await page.waitForTimeout(1200);
-
-    // 2. 若页面未自动跳转，调用带 h5st 签名的 /uc/mobile/loginService
-    if (page.url().includes('passport.jd.com/new/login.aspx')) {
-      const loginResult = await page
-        .evaluate(
-          async ({ phone, smsCode }: { phone: string; smsCode: string }) => {
-            const w = window as unknown as {
-              paramsSingUtils?: (p: { mobile: string }) => Promise<{ h5st?: string; _stk?: string }>;
-              getAliveSsoDomains?: () => string[];
-              _jdtdmap_sessionId?: string;
-            };
-            const getVal = (sel: string) => (document.querySelector(sel) as HTMLInputElement | null)?.value || '';
-            let h5st = '';
-            let _stk = '';
-            if (typeof w.paramsSingUtils === 'function') {
-              try {
-                const signed = await w.paramsSingUtils({ mobile: phone });
-                h5st = signed?.h5st || '';
-                _stk = signed?._stk || '';
-              } catch {
-                // ignore
-              }
-            }
-            const ssoDomains = typeof w.getAliveSsoDomains === 'function' ? w.getAliveSsoDomains().join(',') : '';
-            const formData = new URLSearchParams({
-              uuid: getVal('#uuid'),
-              eid: getVal('#eid'),
-              eid2: getVal('#eid2'),
-              fp: getVal('#sessionId'),
-              _t: getVal('#token'),
-              mobile: phone,
-              mobileCode: smsCode,
-              pageSource: getVal('#pageSource') || 'login2025',
-              pageLocation: getVal('#pageLocation'),
-              loginType: getVal('#loginType') || 'f',
-              sa_token: getVal('#sa_token'),
-              seqSid: w._jdtdmap_sessionId || '',
-              useSlideAuthCode: getVal('#useRandomSlideAuthCode') || '1',
-              authcode: document.querySelector('#sms-login-submit')?.getAttribute('data-code') || '',
-              ssoDomains,
-              h5st,
-              _stk,
-            });
-
-            const res = await fetch(`https://passport.jd.com/uc/mobile/loginService?r=${Math.random()}&version=2015`, {
-              method: 'POST',
-              credentials: 'include',
-              headers: {
-                'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
-                'X-Requested-With': 'XMLHttpRequest',
-              },
-              body: formData.toString(),
-            });
-            return await res.text();
-          },
-          { phone: mobile, smsCode: code },
-        )
-        .catch(() => '');
-
-      if (loginResult) {
-        try {
-          const cleaned = loginResult.trim().replace(/^\(/, '').replace(/\)$/, '');
-          const parsed = JSON.parse(cleaned) as Record<string, string>;
-          const targetUrl = parsed.success || parsed.newSafeVerify || parsed.url;
-          if (targetUrl) {
-            const fullUrl = targetUrl.startsWith('//') ? `https:${targetUrl}` : targetUrl;
-            await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-            await page.waitForTimeout(1000).catch(() => {});
-          }
-        } catch {
-          // ignore
-        }
-      }
-    }
 
     const frameOrAuth = await this.captureRemoteFrameAndCheckAuth('jd', 'sms', mobile);
     if (frameOrAuth.state === 'logged_in') {
@@ -1867,103 +1702,31 @@ export class SessionsController implements OnModuleInit {
   /**
    * 5. 查询当前服务端已保存的京东登录态详情（刷新网页时调用，绝不主动清空有效会话，也绝不重复乱发飞书告警）
    */
-  @Get('jd/status')
-  async getJdStatus() {
-    const session = loadPersistedJdSession();
-    if (!session) {
-      return {
-        state: 'login_required',
-        message: '尚未保存京东登录态，请使用「京东扫码登录」或「手机号验证码登录」',
-      };
-    }
-
-    const verified = await verifyJdCookiesWithLoginService(session.cookieHeader);
-    const hasCoreAuthCookie = Boolean(session.cookies.thor || session.cookies.pt_key);
-    if (verified.authenticated || (hasCoreAuthCookie && Object.keys(verified.refreshedCookies).length > 0)) {
-      const updated = savePersistedJdSession({
-        ...session,
-        pin: verified.pin || session.pin,
-        nickname: verified.nickname || session.nickname,
-        cookies: {
-          ...session.cookies,
-          ...verified.refreshedCookies,
-        },
-        hadValidAuth: true,
-        expiredNotifiedAt: undefined,
-        updatedAt: session.updatedAt,
-        lastKeepAliveAt: new Date().toISOString(),
-      });
-      return {
-        state: 'logged_in',
-        nickname: updated.nickname,
-        pin: updated.pin,
-        mobile: updated.mobile,
-        source: updated.source,
-        updatedAt: updated.updatedAt,
-        lastKeepAliveAt: updated.lastKeepAliveAt,
-        keepAliveCount: updated.keepAliveCount ?? 0,
-        cookieCount: Object.keys(updated.cookies).length,
-        storagePath: getJdSessionFilePath(),
-        message: `京东登录态已长期保存在服务端（账号：${updated.nickname}，共 ${
-          Object.keys(updated.cookies).length
-        } 项 Cookie）`,
-      };
-    }
-
-    if (hasCoreAuthCookie) {
-      const cookieCount = Object.keys(session.cookies).length;
-      return {
-        state: 'logged_in',
-        nickname: session.nickname || session.pin || '京东已登录用户',
-        pin: session.pin || session.nickname || 'jd_user',
-        mobile: session.mobile,
-        source: session.source,
-        updatedAt: session.updatedAt,
-        lastKeepAliveAt: session.lastKeepAliveAt,
-        keepAliveCount: session.keepAliveCount ?? 0,
-        cookieCount,
-        storagePath: getJdSessionFilePath(),
-        message: `京东登录态已长期保存在服务端（账号：${session.nickname || session.pin}，共 ${cookieCount} 项 Cookie）`,
-      };
-    }
-
-    // 仅当之前确实成功登录过 (hadValidAuth === true) 且尚未发送过失效通知时，才发送一次飞书告警，防止未完成验证的半成品会话反复刷屏推送
-    if (session.hadValidAuth && !session.expiredNotifiedAt) {
-      savePersistedJdSession({
-        ...session,
-        expiredNotifiedAt: new Date().toISOString(),
-      });
-      void notifySessionExpiredToFeishu('jd', '服务端京东核心登录 Cookie (thor) 已过期，请重新扫码登录');
-    }
-
+  private jdSessionResponse(result: JdSessionCheck) {
+    const { state, session, message } = result;
     return {
-      state: 'login_required',
-      message: '京东核心登录凭证 (thor) 尚未同步或已过期，请使用下方「京东扫码登录」或「云端实时交互画面」完成登录与安全验证',
+      state,
+      nickname: session?.nickname,
+      pin: session?.pin,
+      source: session?.source,
+      updatedAt: session?.updatedAt,
+      lastKeepAliveAt: session?.lastKeepAliveAt,
+      keepAliveCount: session?.keepAliveCount ?? 0,
+      cookieCount: session ? Object.keys(session.cookies).length : 0,
+      storagePath: session ? getJdSessionFilePath() : undefined,
+      message,
     };
   }
 
-  /**
-   * 6. 手动触发一次服务端京东登录态保活刷新
-   */
+  @Get('jd/status')
+  async getJdStatus() {
+    return this.jdSessionResponse(await runJdSessionKeepAlive());
+  }
+
   @Post('jd/keepalive')
   async manualKeepAlive(@Req() req: Request) {
     validateOrigin(req);
-    const res = await runJdSessionKeepAlive();
-    if (!res.ok || !res.session) {
-      throw new BadRequestException(res.message);
-    }
-    return {
-      state: 'logged_in',
-      nickname: res.session.nickname,
-      pin: res.session.pin,
-      source: res.session.source,
-      updatedAt: res.session.updatedAt,
-      lastKeepAliveAt: res.session.lastKeepAliveAt,
-      keepAliveCount: res.session.keepAliveCount,
-      cookieCount: Object.keys(res.session.cookies).length,
-      storagePath: getJdSessionFilePath(),
-      message: res.message,
-    };
+    return this.getJdStatus();
   }
 
   /**
@@ -1972,25 +1735,14 @@ export class SessionsController implements OnModuleInit {
   @Post('jd/logout')
   async logoutJd(@Req() req: Request) {
     validateOrigin(req);
+    authVersion.jd++;
     const filePath = getJdSessionFilePath();
-    if (existsSync(filePath)) {
-      try {
-        unlinkSync(filePath);
-      } catch {
-        // ignore unlink error
-      }
-    }
+    if (existsSync(filePath)) unlinkSync(filePath);
     activeJdQrSession = null;
-    if (headlessAuthContext) {
-      const jdCookies = await headlessAuthContext
-        .cookies(['https://www.jd.com', 'https://passport.jd.com', 'https://item.jd.com', 'https://m.jd.com'])
-        .catch(() => []);
-      for (const c of jdCookies) {
-        await headlessAuthContext
-          .addCookies([{ name: c.name, value: '', domain: c.domain, path: c.path, expires: 0 }])
-          .catch(() => {});
-      }
-    }
+    const page = headlessLoginPage;
+    headlessLoginPage = null;
+    await page?.close().catch(() => {});
+    await headlessAuthContext?.clearCookies({ domain: accountDomains.jd });
     return {
       state: 'login_required',
       nickname: '未登录',
@@ -2021,319 +1773,71 @@ export class SessionsController implements OnModuleInit {
   }
 
   private async executeStartTaobaoQrCode() {
-    const context = await getTaobaoHeadlessContext();
-    if (!headlessTbPage || headlessTbPage.isClosed()) {
-      headlessTbPage = await context.newPage();
-      await headlessTbPage.setViewportSize({ width: 1280, height: 800 }).catch(() => {});
-    }
-    const page = headlessTbPage;
-
-    let capturedGen: { t?: number; ck?: string; codeContent?: string; resultCode?: number } | null = null;
-
-    const onResponse = async (res: { url: () => string; json: () => Promise<unknown> }) => {
-      const u = res.url();
-      if (u.includes('qrCode/generate.do')) {
-        try {
-          const json = (await res.json()) as {
-            content?: { data?: { t?: number; ck?: string; codeContent?: string; resultCode?: number } };
-          };
-          if (json?.content?.data?.ck) {
-            capturedGen = json.content.data;
-          }
-        } catch {
-          // ignore
-        }
-      } else if (u.includes('qrCode/query.do') && activeTaobaoQrSession) {
-        try {
-          const json = (await res.json()) as {
-            content?: {
-              data?: {
-                qrCodeStatus?: 'NEW' | 'SCANED' | 'CONFIRMED' | 'EXPIRED' | 'CANCELED' | 'ERROR';
-                titleMsg?: string;
-                redirectUrl?: string;
-                iframeRedirectUrl?: string;
-                asyncUrls?: string[];
-              };
-            };
-          };
-          const d = json?.content?.data;
-          if (d?.qrCodeStatus) {
-            activeTaobaoQrSession.lastStatus = d.qrCodeStatus;
-            activeTaobaoQrSession.lastMessage = d.titleMsg || '';
-            const targetRedirect = d.redirectUrl || d.iframeRedirectUrl || d.asyncUrls?.[0];
-            if (targetRedirect) {
-              activeTaobaoQrSession.redirectUrl = targetRedirect;
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }
-    };
-
-    page.removeAllListeners('response');
-    page.on('response', onResponse);
-
-    await page.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 22000 });
-
-    const canvasLoc = page.locator('canvas').first();
-    for (let attempt = 0; attempt < 25; attempt++) {
-      const visible = await canvasLoc.isVisible().catch(() => false);
-      if (visible) break;
-      await page
-        .evaluate(() => {
-          const candidates = Array.from(document.querySelectorAll('a, div, span, i'));
-          const otherLink = candidates.find(el => {
-            const txt = (el.textContent || '').trim();
-            return txt === '使用其他账号登录' || txt === '其他账号登录' || txt === '扫码登录';
-          }) as HTMLElement | undefined;
-          if (otherLink) {
-            otherLink.click();
-            return;
-          }
-          const qrIcon = document.querySelector('.icon-qrcode, .J_Quick2Static') as HTMLElement | null;
-          if (qrIcon) qrIcon.click();
-        })
-        .catch(() => {});
-      await page.waitForTimeout(250);
-    }
-
-    await canvasLoc.waitFor({ state: 'visible', timeout: 8000 });
-    await page.waitForTimeout(250);
-
-    const meta = await page
-      .evaluate(async () => {
-        const w = window as unknown as {
-          viewData?: { loginFormData?: { _csrf?: string } };
-        };
-        const csrf = w.viewData?.loginFormData?._csrf || '';
-        return { csrf };
-      })
-      .catch(() => ({ csrf: '' }));
-
-    for (let waitAttempt = 0; waitAttempt < 12 && !capturedGen; waitAttempt++) {
-      await page.waitForTimeout(150);
-    }
-
-    const pngBuffer = await canvasLoc.screenshot({ type: 'png' });
-    const qrImage = `data:image/png;base64,${pngBuffer.toString('base64')}`;
-    const now = Date.now();
-    const genInfo = (capturedGen || {}) as { t?: number; ck?: string; codeContent?: string };
-    const tVal = genInfo.t || now;
-    const ckVal = genInfo.ck || `qr_code_sm2_${now}`;
-    const codeContentVal =
-      genInfo.codeContent ||
-      `https://login.m.taobao.com/qrcodeCheck.htm?lgToken=${ckVal}&tbScanOpenType=Notification`;
-
-    activeTaobaoQrSession = {
-      t: tVal,
-      ck: ckVal,
-      codeContent: codeContentVal,
-      csrf: meta.csrf,
-      qrImage,
-      createdAt: now,
-      expiresAt: now + 120_000,
+    const attempt: ActiveTaobaoQrSession = {
+      expiresAt: Date.now() + 120_000,
       lastStatus: 'NEW',
-      lastMessage: '二维码未扫描，请打开手机淘宝 App 扫码登录',
     };
+    activeTaobaoQrSession = attempt;
+    const page = await this.getOrCreateRemotePage('taobao', { keepCurrent: false });
+    const qrSelector = '#qrcode-img canvas:visible, #qrcode-img img:visible, .qrcode-img canvas:visible';
+    const onResponse = async (res: { url: () => string; json: () => Promise<unknown> }) => {
+      const url = platformUrl(res.url(), 'taobao');
+      if (!url?.pathname.endsWith('/qrCode/query.do') || activeTaobaoQrSession !== attempt) return;
+      const json = await res.json().catch(() => null) as {
+        content?: { data?: { qrCodeStatus?: ActiveTaobaoQrSession['lastStatus'] } };
+      } | null;
+      if (json?.content?.data?.qrCodeStatus) attempt.lastStatus = json.content.data.qrCodeStatus;
+    };
+    page.on('response', onResponse);
+    const removeObserver = () => page.off('response', onResponse);
+    const timeout = setTimeout(removeObserver, 120_000);
+    timeout.unref();
 
-    return {
-      state: 'qr_ready',
-      qrImage,
-      token: ckVal,
-      t: tVal,
-      codeContent: codeContentVal,
-      createdAt: new Date(now).toISOString(),
-      expiresAt: new Date(activeTaobaoQrSession.expiresAt).toISOString(),
-      protocol: {
-        generateUrl: TB_QR_GENERATE_URL,
-        queryUrl: TB_QR_QUERY_URL,
-      },
-      message: '请打开手机淘宝 App 扫描下方二维码登录',
-    };
+    try {
+      const switchAccount = page.getByText(/^(使用其他账号登录|其他账号登录)$/).filter({ visible: true }).first();
+      if (await switchAccount.isVisible()) await switchAccount.click({ timeout: 2500 });
+      const qr = page.locator(qrSelector).first();
+      await qr.waitFor({ state: 'visible', timeout: 8000 });
+      const png = await qr.screenshot({ type: 'png', timeout: 3500 });
+      if (activeTaobaoQrSession !== attempt) throw new Error('二维码已更新');
+      return {
+        state: 'qr_ready',
+        qrImage: `data:image/png;base64,${png.toString('base64')}`,
+        expiresAt: new Date(attempt.expiresAt).toISOString(),
+        message: '请打开手机淘宝 App 扫描下方二维码登录',
+      };
+    } catch {
+      removeObserver();
+      activeTaobaoQrSession = null;
+      const frame = await this.captureRemoteFrameAndCheckAuth('taobao');
+      return frame.state === 'logged_in' ? frame : {
+        ...frame,
+        message: '淘宝登录页未显示二维码，请在实时画面中选择扫码登录或按平台提示操作',
+      };
+    }
   }
 
-  /**
-   * 7b. 轮询淘宝二维码扫码状态
-   */
   @Get('taobao/qrcode/status')
+  @Header('Cache-Control', 'no-store')
   async checkTaobaoQrStatus(@Req() req: Request) {
     validateOrigin(req);
-    if (!activeTaobaoQrSession) {
-      return {
-        state: 'qr_none',
-        code: 0,
-        message: '当前没有进行中的淘宝扫码会话',
-      };
+    const attempt = activeTaobaoQrSession;
+    if (!attempt) return { state: 'qr_none', code: 0, message: '当前没有进行中的淘宝扫码会话' };
+    if (Date.now() > attempt.expiresAt || attempt.lastStatus === 'EXPIRED') {
+      return { state: 'qr_expired', code: 103, message: '淘宝二维码已失效，请重新获取二维码' };
     }
-
-    if (Date.now() > activeTaobaoQrSession.expiresAt) {
-      return {
-        state: 'qr_expired',
-        code: 103,
-        qrCodeStatus: 'EXPIRED',
-        message: '淘宝二维码已超时失效，请点击刷新重新获取二维码',
-      };
+    if (attempt.lastStatus === 'CANCELED' || attempt.lastStatus === 'ERROR') {
+      return { state: 'qr_cancelled', code: 105, message: '淘宝扫码已取消，请重新获取二维码' };
     }
-
-    if (headlessTbPage && !headlessTbPage.isClosed()) {
-      const pageUrl = headlessTbPage.url();
-      if (
-        !pageUrl.includes('login.taobao.com') &&
-        (pageUrl.includes('taobao.com') || pageUrl.includes('tmall.com'))
-      ) {
-        activeTaobaoQrSession.lastStatus = 'CONFIRMED';
-      } else if (activeTaobaoQrSession.lastStatus === 'NEW' || activeTaobaoQrSession.lastStatus === 'SCANED') {
-        const queryData = await headlessTbPage
-          .evaluate(
-            async ({ t, ck, csrf }: { t: number; ck: string; csrf: string }) => {
-              const body = new URLSearchParams({
-                t: String(t),
-                ck,
-                ua: '',
-                sub: 'true',
-                hitRSA2048Gray: 'true',
-                bizEntrance: 'taobao_pc',
-                bizName: 'taobao',
-                _csrf: csrf,
-                lang: 'zh_CN',
-                umidToken: '',
-                umidTag: 'NOT_INIT',
-                navlanguage: 'zh-CN',
-                navUserAgent: navigator.userAgent,
-                navPlatform: navigator.platform || 'MacIntel',
-                isIframe: 'false',
-                banThirdPartyCookie: 'true',
-                documentReferer: '',
-                defaultView: 'qrcode',
-              });
-              const r = await fetch('/havanaone/loginLegacy/qrCode/query.do?bizEntrance=taobao_pc&bizName=taobao', {
-                method: 'POST',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: body.toString(),
-              });
-              const j = (await r.json()) as {
-                content?: {
-                  data?: {
-                    qrCodeStatus?: 'NEW' | 'SCANED' | 'CONFIRMED' | 'EXPIRED' | 'CANCELED' | 'ERROR';
-                    titleMsg?: string;
-                    redirectUrl?: string;
-                    iframeRedirectUrl?: string;
-                    asyncUrls?: string[];
-                  };
-                };
-              };
-              if (j?.content?.data?.qrCodeStatus === 'CONFIRMED') {
-                const w = window as unknown as {
-                  miniLogin?: { handleLoginResult?: (data: unknown) => void };
-                };
-                try {
-                  w.miniLogin?.handleLoginResult?.(j.content.data);
-                } catch {
-                  // ignore
-                }
-                const asyncUrls = j.content.data.asyncUrls || [];
-                for (const url of asyncUrls) {
-                  try {
-                    await fetch(url, { credentials: 'include', mode: 'no-cors' });
-                  } catch {
-                    // ignore
-                  }
-                }
-              }
-              return j?.content?.data || null;
-            },
-            {
-              t: activeTaobaoQrSession.t,
-              ck: activeTaobaoQrSession.ck,
-              csrf: activeTaobaoQrSession.csrf,
-            },
-          )
-          .catch(() => null);
-
-        if (queryData?.qrCodeStatus) {
-          activeTaobaoQrSession.lastStatus = queryData.qrCodeStatus;
-          activeTaobaoQrSession.lastMessage = queryData.titleMsg || activeTaobaoQrSession.lastMessage;
-          const targetRedirect = queryData.redirectUrl || queryData.iframeRedirectUrl || queryData.asyncUrls?.[0];
-          if (targetRedirect) {
-            activeTaobaoQrSession.redirectUrl = targetRedirect;
-          }
-        }
-      }
+    const url = headlessTbPage && platformUrl(headlessTbPage.url(), 'taobao');
+    if (attempt.lastStatus === 'CONFIRMED' || (url && !/^login\./.test(url.hostname))) {
+      activeTaobaoQrSession = null;
+      return this.captureRemoteFrameAndCheckAuth('taobao');
     }
-
-    switch (activeTaobaoQrSession.lastStatus) {
-      case 'NEW':
-        return {
-          state: 'qr_waiting',
-          code: 100,
-          qrCodeStatus: 'NEW',
-          message: activeTaobaoQrSession.lastMessage || '二维码未扫描，请打开手机淘宝 App 扫一扫',
-        };
-      case 'SCANED':
-        return {
-          state: 'qr_scanned',
-          code: 101,
-          qrCodeStatus: 'SCANED',
-          message: '扫描成功！请在手机淘宝 App 上点击「确认登录」',
-        };
-      case 'EXPIRED':
-        return {
-          state: 'qr_expired',
-          code: 103,
-          qrCodeStatus: 'EXPIRED',
-          message: '淘宝二维码已失效，请点击刷新二维码',
-        };
-      case 'CANCELED':
-      case 'ERROR':
-        return {
-          state: 'qr_cancelled',
-          code: 105,
-          qrCodeStatus: activeTaobaoQrSession.lastStatus,
-          message: activeTaobaoQrSession.lastMessage || '已在手机端取消扫码登录，请重新获取二维码',
-        };
-      case 'CONFIRMED': {
-        if (headlessTbPage && !headlessTbPage.isClosed()) {
-          await headlessTbPage.waitForTimeout(800).catch(() => {});
-          if (activeTaobaoQrSession.redirectUrl) {
-            await headlessTbPage
-              .goto(activeTaobaoQrSession.redirectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 })
-              .catch(() => {});
-          }
-          await headlessTbPage
-            .goto('https://login.taobao.com/member/login.jhtml?redirectURL=https%3A%2F%2Fwww.taobao.com%2F', {
-              waitUntil: 'domcontentloaded',
-              timeout: 15000,
-            })
-            .catch(() => {});
-          await headlessTbPage
-            .evaluate(() => {
-              const btn = document.querySelector(
-                '.has-login button, .has-login .fm-button, button.fm-button',
-              ) as HTMLButtonElement | null;
-              if (btn && (btn.textContent || '').includes('登录')) btn.click();
-            })
-            .catch(() => {});
-          await headlessTbPage.waitForTimeout(1500).catch(() => {});
-        }
-        const saved = await syncTaobaoCookiesFromHeadlessContext({}, 'qrcode');
-        activeTaobaoQrSession = null;
-        return {
-          state: 'logged_in',
-          code: 200,
-          qrCodeStatus: 'CONFIRMED',
-          nickname: saved.nick,
-          pin: saved.uid,
-          source: saved.source,
-          updatedAt: saved.updatedAt,
-          lastKeepAliveAt: saved.lastKeepAliveAt,
-          cookieCount: Object.keys(saved.cookies).length,
-          storagePath: getTaobaoSessionFilePath(),
-          message: `淘宝扫码登录成功（账号：${saved.nick}），登录态已长期保存在服务端`,
-        };
-      }
+    if (attempt.lastStatus === 'SCANED') {
+      return { state: 'qr_scanned', code: 101, message: '请在手机淘宝 App 确认登录' };
     }
+    return { state: 'qr_waiting', code: 100, message: '请打开手机淘宝 App 扫码登录' };
   }
 
   /**
@@ -2348,6 +1852,7 @@ export class SessionsController implements OnModuleInit {
       throw new BadRequestException('请输入有效的 11 位中国大陆手机号码');
     }
 
+    activeTaobaoQrSession = null;
     const page = await this.getOrCreateRemotePage('taobao', { keepCurrent: true });
     if (!page.url().includes('login.taobao.com')) {
       await page.goto(TB_LOGIN_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
@@ -2383,7 +1888,7 @@ export class SessionsController implements OnModuleInit {
       })
       .catch(() => {});
 
-    await page.fill('#fm-sms-login-id, input[name="fm-sms-login-id"]', mobile).catch(() => {});
+    await page.locator('#fm-sms-login-id:visible').fill(mobile, { timeout: 3500 }).catch(() => {});
     await page
       .evaluate(() => {
         const agree = document.querySelector('#fm-agreement-checkbox') as HTMLInputElement | null;
@@ -2403,7 +1908,7 @@ export class SessionsController implements OnModuleInit {
       content?: { data?: { resultCode?: number; titleMsg?: string }; success?: boolean };
     } | null;
     const resultCode = sendRes?.content?.data?.resultCode;
-    if (resultCode === 100 || sendRes?.content?.success) {
+    if (resultCode === 100) {
       return {
         ok: true,
         state: 'sms_sent',
@@ -2415,6 +1920,7 @@ export class SessionsController implements OnModuleInit {
     }
 
     const frame = await this.captureRemoteFrameAndCheckAuth('taobao', 'sms', mobile);
+    if (frame.state === 'logged_in') return frame;
     return {
       ...frame,
       ok: false,
@@ -2462,13 +1968,13 @@ export class SessionsController implements OnModuleInit {
       })
       .catch(() => {});
 
-    await page.fill('#fm-sms-login-id, input[name="fm-sms-login-id"]', mobile).catch(() => {});
-    await page.fill('#fm-smscode, input[name="fm-smscode"]', code).catch(() => {});
+    await page.locator('#fm-sms-login-id:visible').fill(mobile, { timeout: 3500 }).catch(() => {});
+    await page.locator('#fm-smscode:visible').fill(code, { timeout: 3500 }).catch(() => {});
     await page
       .evaluate(() => {
         const agree = document.querySelector('#fm-agreement-checkbox') as HTMLInputElement | null;
         if (agree && !agree.checked) agree.click();
-        const submitBtn = document.querySelector('button.sms-login, button.fm-submit') as HTMLElement | null;
+        const submitBtn = document.querySelector('button.sms-login') as HTMLElement | null;
         if (submitBtn) submitBtn.click();
       })
       .catch(() => {});
@@ -2484,30 +1990,14 @@ export class SessionsController implements OnModuleInit {
     const resData = loginRes?.content?.data;
     const targetUrl = resData?.redirectUrl || resData?.iframeRedirectUrl;
     if (targetUrl) {
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+      const url = platformUrl(targetUrl, 'taobao');
+      if (url) await page.goto(url.href, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
       await page.waitForTimeout(1000).catch(() => {});
     }
 
     const frameOrAuth = await this.captureRemoteFrameAndCheckAuth('taobao', 'sms', mobile);
     if (frameOrAuth.state === 'logged_in') {
       return frameOrAuth;
-    }
-
-    if (resData?.resultCode === 100) {
-      const saved = await syncTaobaoCookiesFromHeadlessContext({}, 'sms', mobile);
-      activeTaobaoQrSession = null;
-      return {
-        state: 'logged_in',
-        nickname: saved.nick,
-        pin: saved.uid,
-        mobile: saved.mobile,
-        source: saved.source,
-        updatedAt: saved.updatedAt,
-        lastKeepAliveAt: saved.lastKeepAliveAt,
-        cookieCount: Object.keys(saved.cookies).length,
-        storagePath: getTaobaoSessionFilePath(),
-        message: `淘宝手机号验证码登录成功（账号：${saved.nick}），登录态已长期保存在服务端`,
-      };
     }
 
     return {
@@ -2523,7 +2013,7 @@ export class SessionsController implements OnModuleInit {
   @Get('taobao/status')
   async getTaobaoStatus() {
     const saved = loadPersistedTaobaoSession();
-    const hasCoreAuthCookie = Boolean(saved && (saved.cookies.uc3 || saved.cookies.sgcookie || saved.cookies.cookie17));
+    const hasCoreAuthCookie = saved && hasTaobaoAuth(saved.cookies);
     if (saved && hasCoreAuthCookie && Object.keys(saved.cookies).length > 0) {
       return {
         state: 'logged_in',
@@ -2580,25 +2070,14 @@ export class SessionsController implements OnModuleInit {
   @Post('taobao/logout')
   async logoutTaobao(@Req() req: Request) {
     validateOrigin(req);
+    authVersion.taobao++;
     const filePath = getTaobaoSessionFilePath();
-    if (existsSync(filePath)) {
-      try {
-        unlinkSync(filePath);
-      } catch {
-        // ignore unlink error
-      }
-    }
+    if (existsSync(filePath)) unlinkSync(filePath);
     activeTaobaoQrSession = null;
-    if (headlessAuthContext) {
-      const tbCookies = await headlessAuthContext
-        .cookies(['https://www.taobao.com', 'https://www.tmall.com', 'https://login.taobao.com'])
-        .catch(() => []);
-      for (const c of tbCookies) {
-        await headlessAuthContext
-          .addCookies([{ name: c.name, value: '', domain: c.domain, path: c.path, expires: 0 }])
-          .catch(() => {});
-      }
-    }
+    const page = headlessTbPage;
+    headlessTbPage = null;
+    await page?.close().catch(() => {});
+    await headlessAuthContext?.clearCookies({ domain: accountDomains.taobao });
     return {
       state: 'login_required',
       nickname: '未登录',

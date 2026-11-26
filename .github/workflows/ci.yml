@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: pricepulse-ci-${{ github.ref }}
@@ -38,14 +37,17 @@ jobs:
       - name: Build API and Web production bundles
         run: npm run build
 
-      - name: Run URL & SKU parser unit tests
-        run: node apps/api/test-product-url.cjs
+      - name: Run parser and platform regression tests
+        run: node --test apps/api/test-*.cjs
 
   docker-image:
-    name: Build & Publish Docker Image
+    name: Build & Validate Docker Image
     needs: test-and-build
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -61,27 +63,44 @@ jobs:
         run: |
           IMAGE_REPO="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           IMAGE_TAG="${GITHUB_SHA::12}"
-          docker build -t "${IMAGE_REPO}:${IMAGE_TAG}" -t "${IMAGE_REPO}:latest" .
+          docker build -t "${IMAGE_REPO}:${IMAGE_TAG}" .
           echo "IMAGE_REPO=${IMAGE_REPO}" >> "$GITHUB_ENV"
           echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
 
       - name: Container runtime smoke test
         run: |
-          docker run -d --name pricepulse-smoke -p 3001:3001 "${IMAGE_REPO}:${IMAGE_TAG}"
+          docker run -d --name pricepulse-smoke "${IMAGE_REPO}:${IMAGE_TAG}"
+          trap 'docker rm -f pricepulse-smoke >/dev/null' EXIT
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:3001/api/health | grep -q '"status":"ok"'; then
-              curl -fsS http://127.0.0.1:3001/ | grep -q '<div id="root"></div>'
+            if docker exec pricepulse-smoke curl -fsS http://127.0.0.1:3001/api/health | grep -q '"status":"ok"'; then
+              docker exec pricepulse-smoke curl -fsS http://127.0.0.1:3001/ | grep -q '<div id="root"></div>'
+              docker exec pricepulse-smoke node -e '
+                const assert = require("node:assert/strict");
+                const { getJdHeadlessContext, getTaobaoHeadlessContext } = require("./apps/api/dist/sessions");
+                (async () => {
+                  const [jd, taobao] = await Promise.all([getJdHeadlessContext(), getTaobaoHeadlessContext()]);
+                  assert.equal(jd, taobao);
+                  try {
+                    const page = await taobao.newPage();
+                    await page.goto("data:text/html,<h1>PricePulse</h1>");
+                    assert.equal(await page.locator("h1").innerText(), "PricePulse");
+                    assert.ok((await page.screenshot()).length > 0);
+                  } finally {
+                    await jd.close();
+                  }
+                })().catch(error => { console.error(error); process.exitCode = 1; });'
               echo "Container smoke test passed!"
-              docker rm -f pricepulse-smoke
               exit 0
             fi
             sleep 1
           done
           docker logs pricepulse-smoke
-          docker rm -f pricepulse-smoke
           exit 1
 
       - name: Push Docker image to GHCR
         run: |
           docker push "${IMAGE_REPO}:${IMAGE_TAG}"
-          docker push "${IMAGE_REPO}:latest"
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            docker tag "${IMAGE_REPO}:${IMAGE_TAG}" "${IMAGE_REPO}:latest"
+            docker push "${IMAGE_REPO}:latest"
+          fi

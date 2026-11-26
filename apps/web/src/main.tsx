@@ -710,6 +710,7 @@ function RemoteBrowserViewport({
   const [dragPoints, setDragPoints] = useState<Array<{ x: number; y: number }>>([]);
   const isDraggingRef = useRef(false);
   const actionBusyRef = useRef(false);
+  const frameBusyRef = useRef(false);
   const imgRef = useRef<HTMLImageElement | null>(null);
 
   const vw = frame?.viewport?.width || 1280;
@@ -750,7 +751,8 @@ function RemoteBrowserViewport({
       void initRemote(false);
     }
     const timer = window.setInterval(async () => {
-      if (isDraggingRef.current || actionBusyRef.current) return;
+      if (isDraggingRef.current || actionBusyRef.current || frameBusyRef.current) return;
+      frameBusyRef.current = true;
       try {
         const res = await fetch(`/api/sessions/${platform}/remote/frame`);
         if (!res.ok) return;
@@ -759,11 +761,13 @@ function RemoteBrowserViewport({
           onLoggedIn(data);
           return;
         }
-        if (data.screenshot) {
+        if (data.screenshot && !actionBusyRef.current && !isDraggingRef.current) {
           setFrame(data);
         }
       } catch {
-        // ignore transient frame error
+        // Retain the last frame while the connection recovers.
+      } finally {
+        frameBusyRef.current = false;
       }
     }, 1350);
     return () => window.clearInterval(timer);
@@ -1136,14 +1140,19 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!jdQr || !['qr_ready', 'qr_waiting', 'qr_scanned'].includes(jdQr.state)) {
+    if (!showJdAuthPanel || authTab !== 'qrcode' || !jdQr || !['qr_ready', 'qr_waiting', 'qr_scanned'].includes(jdQr.state)) {
       return;
     }
+    const controller = new AbortController();
+    let polling = false;
     const timer = window.setInterval(async () => {
+      if (polling) return;
+      polling = true;
       try {
-        const res = await fetch('/api/sessions/jd/qrcode/status');
+        const res = await fetch('/api/sessions/jd/qrcode/status', { signal: controller.signal });
         if (!res.ok) return;
         const data = (await res.json()) as JdQrCodeState & PlatformSessionInfo;
+        if (controller.signal.aborted) return;
         if (data.state === 'logged_in') {
           setJdQr(null);
           setShowJdAuthPanel(false);
@@ -1170,11 +1179,16 @@ function App() {
         );
         setJdMessage(`扫码状态 [${data.code ?? '-'}]：${data.message}`);
       } catch {
-        // ignore transient error
+        // Retry on the next poll.
+      } finally {
+        polling = false;
       }
     }, 2200);
-    return () => window.clearInterval(timer);
-  }, [jdQr?.state]);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [jdQr?.state, showJdAuthPanel, authTab]);
 
   useEffect(() => {
     if (smsCountdown <= 0) return;
@@ -1186,18 +1200,30 @@ function App() {
 
   // 淘宝二维码扫码状态实时轮询（登录成功后二维码实时自动关闭并切换为已登录状态）
   useEffect(() => {
-    if (!tbQr || !['qr_ready', 'qr_waiting', 'qr_scanned'].includes(tbQr.state)) {
+    if (!showTbAuthPanel || tbAuthTab !== 'qrcode' || !tbQr || !['qr_ready', 'qr_waiting', 'qr_scanned'].includes(tbQr.state)) {
       return;
     }
+    const controller = new AbortController();
+    let polling = false;
     const timer = window.setInterval(async () => {
+      if (polling) return;
+      polling = true;
       try {
-        const res = await fetch('/api/sessions/taobao/qrcode/status');
+        const res = await fetch('/api/sessions/taobao/qrcode/status', { signal: controller.signal });
         if (!res.ok) return;
         const data = (await res.json()) as JdQrCodeState & PlatformSessionInfo;
+        if (controller.signal.aborted) return;
         if (data.state === 'logged_in') {
           setTbQr(null);
           setShowTbAuthPanel(false);
           setTbSession(data);
+          setTbMessage(data.message);
+          return;
+        }
+        if (data.state === 'verify_required') {
+          setTbQr(null);
+          setTbRemoteFrame(data);
+          setTbAuthTab('remote');
           setTbMessage(data.message);
           return;
         }
@@ -1212,11 +1238,16 @@ function App() {
         );
         setTbMessage(`淘宝扫码状态 [${data.code ?? '-'}]：${data.message}`);
       } catch {
-        // ignore transient error
+        // Retry on the next poll.
+      } finally {
+        polling = false;
       }
     }, 2200);
-    return () => window.clearInterval(timer);
-  }, [tbQr?.state]);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [tbQr?.state, showTbAuthPanel, tbAuthTab]);
 
   useEffect(() => {
     if (tbSmsCountdown <= 0) return;
@@ -1295,6 +1326,20 @@ function App() {
       const response = await fetch('/api/sessions/jd/qrcode/start', { method: 'POST' });
       const data = (await response.json()) as JdQrCodeState;
       if (!response.ok) throw new Error(data.message || '获取京东二维码失败');
+      if (data.state === 'verify_required') {
+        setJdQr(null);
+        setJdRemoteFrame(data);
+        setAuthTab('remote');
+        setJdMessage(data.message);
+        return;
+      }
+      if (data.state === 'logged_in') {
+        setJdQr(null);
+        setJdSession(data);
+        setShowJdAuthPanel(false);
+        setJdMessage(data.message);
+        return;
+      }
       setJdQr(data);
       setJdMessage(data.message);
     } catch (error) {
@@ -1318,6 +1363,12 @@ function App() {
       });
       const data = (await res.json()) as RemoteBrowserFrame & { message?: string; countdown?: number };
       if (!res.ok) throw new Error(data.message || '发送验证码失败');
+      if (data.state === 'logged_in') {
+        setJdSession(data as PlatformSessionInfo);
+        setShowJdAuthPanel(false);
+        setJdMessage(data.message || '登录成功');
+        return;
+      }
       if (data.state === 'verify_required') {
         setJdRemoteFrame(data);
         setAuthTab('remote');
@@ -1384,8 +1435,9 @@ function App() {
     try {
       const response = await fetch('/api/sessions/jd/check', { method: 'POST' });
       const data = (await response.json()) as PlatformSessionInfo;
+      if (!response.ok) throw new Error(data.message);
+      setJdSession(data);
       if (data.state === 'logged_in') {
-        setJdSession(data);
         setJdQr(null);
         setShowJdAuthPanel(false);
       }
@@ -1421,6 +1473,20 @@ function App() {
       const response = await fetch('/api/sessions/taobao/qrcode/start', { method: 'POST' });
       const data = (await response.json()) as JdQrCodeState;
       if (!response.ok) throw new Error(data.message || '获取淘宝二维码失败');
+      if (data.state === 'verify_required') {
+        setTbQr(null);
+        setTbRemoteFrame(data);
+        setTbAuthTab('remote');
+        setTbMessage(data.message);
+        return;
+      }
+      if (data.state === 'logged_in') {
+        setTbQr(null);
+        setTbSession(data);
+        setShowTbAuthPanel(false);
+        setTbMessage(data.message);
+        return;
+      }
       setTbQr(data);
       setTbMessage(data.message);
     } catch (error) {
@@ -1444,6 +1510,12 @@ function App() {
       });
       const data = (await res.json()) as RemoteBrowserFrame & { message?: string; countdown?: number };
       if (!res.ok) throw new Error(data.message || '发送验证码失败');
+      if (data.state === 'logged_in') {
+        setTbSession(data as PlatformSessionInfo);
+        setShowTbAuthPanel(false);
+        setTbMessage(data.message || '登录成功');
+        return;
+      }
       if (data.state === 'verify_required') {
         setTbRemoteFrame(data);
         setTbAuthTab('remote');
@@ -1495,8 +1567,9 @@ function App() {
     try {
       const response = await fetch('/api/sessions/taobao/check', { method: 'POST' });
       const data = (await response.json()) as PlatformSessionInfo;
+      if (!response.ok) throw new Error(data.message);
+      setTbSession(data);
       if (data.state === 'logged_in') {
-        setTbSession(data);
         setTbQr(null);
         setShowTbAuthPanel(false);
       }
@@ -1640,7 +1713,7 @@ function App() {
             <span>京东登录态</span>
             <span className="status-inline">
               <i className={`apple-dot ${jdSession?.state === 'logged_in' ? 'green' : 'gray'}`} />
-              {jdSession?.state === 'logged_in' ? jdSession.nickname || '已登录' : '未登录'}
+              {jdSession?.state === 'logged_in' ? jdSession.nickname || '已登录' : jdSession?.state === 'unverified' ? '待复核' : '未登录'}
             </span>
           </div>
           <div className="sidebar-status-row">
@@ -1934,7 +2007,7 @@ function App() {
                   <p>支持网页内二维码扫码或手机号短信验证码登录，Cookie 长期保存在服务端并每 10 分钟自动保活</p>
                 </div>
                 <span className={`apple-badge ${jdSession?.state === 'logged_in' ? 'green' : 'neutral'}`}>
-                  {jdSession?.state === 'logged_in' ? '已登录' : '未登录'}
+                  {jdSession?.state === 'logged_in' ? '已登录' : jdSession?.state === 'unverified' ? '待复核' : '未登录'}
                 </span>
               </div>
 
@@ -1947,7 +2020,7 @@ function App() {
                   <div className="account-cells">
                     <div className="account-cell">
                       <span>京东昵称</span>
-                      <strong>{jdSession?.state === 'logged_in' ? jdSession.nickname : '未登录'}</strong>
+                      <strong>{jdSession?.nickname || '未登录'}</strong>
                     </div>
                     <div className="account-cell">
                       <span>账号标识 (PIN)</span>
@@ -1959,7 +2032,7 @@ function App() {
                     </div>
                     <div className="account-cell">
                       <span>服务端保活机制</span>
-                      <strong>{jdSession?.state === 'logged_in' ? '每 10 分钟自动续期' : '登录后自动开启'}</strong>
+                      <strong>{jdSession?.state === 'logged_in' ? '每 10 分钟检查会话' : '登录后自动开启'}</strong>
                     </div>
                   </div>
 
@@ -2193,7 +2266,7 @@ function App() {
                     </div>
                     <div className="account-cell">
                       <span>服务端保活机制</span>
-                      <strong>{tbSession?.state === 'logged_in' ? '每 10 分钟自动续期' : '登录后自动开启'}</strong>
+                      <strong>{tbSession?.state === 'logged_in' ? '每 10 分钟检查会话' : '登录后自动开启'}</strong>
                     </div>
                   </div>
 
