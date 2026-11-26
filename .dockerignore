@@ -2,6 +2,14 @@ node_modules
 apps/*/node_modules
 apps/*/dist
 .local-data
+local-data
+data
+config
+**/PriceDrop
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
 .git
 .github
 docs/images

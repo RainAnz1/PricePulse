@@ -5,6 +5,7 @@
 
 # 1. 本地运行数据、私人登录态 Cookie、浏览器持久化 Profile 与 Webhook 配置（高敏核心）
 .local-data/
+local-data/
 **/PriceDrop/
 data/
 cookies/
