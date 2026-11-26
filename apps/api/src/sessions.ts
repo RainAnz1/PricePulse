@@ -249,13 +249,15 @@ function platformOf(value: string): Platform {
 
 function validateOrigin(req: Request) {
   const origin = req.get('origin');
-  if (req.get('sec-fetch-site') === 'cross-site') {
+  const fetchSite = req.get('sec-fetch-site');
+  if (fetchSite === 'cross-site' || fetchSite === 'same-site') {
     throw new ForbiddenException('请从当前 PricePulse 页面发起请求');
   }
   if (!origin) return;
   try {
     const parsed = new URL(origin);
-    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.host !== req.get('host')) {
+    if (!['http:', 'https:'].includes(parsed.protocol) ||
+        (fetchSite !== 'same-origin' && parsed.host !== req.get('host'))) {
       throw new ForbiddenException('非法的请求来源协议');
     }
   } catch {
@@ -1028,10 +1030,9 @@ export class SessionsController implements OnModuleInit {
       title,
       screenshot,
       viewport: { width: 1280, height: 800 },
-      message:
-        platform === 'jd'
-          ? '京东云端实时交互画面已就绪：可直接在画面中点击、拖动滑块、输入验证码或完成安全认证，登录成功后将自动保存会话'
-          : '淘宝云端实时交互画面已就绪：可直接在画面中拖动滑块、点击按钮或扫码登录，登录成功后将自动保存会话',
+      message: screenshot
+        ? '请在下方官方登录页面按平台提示操作，登录完成后会保存会话'
+        : '暂时无法显示平台登录页，请重试或重置登录页面',
     };
   }
 

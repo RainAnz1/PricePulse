@@ -23,6 +23,20 @@ test('JD uses the displayed offer in either order and preserves a lower referenc
   });
 });
 
+test('remote login rejects cross-origin requests and allows same-origin traffic through a proxy', async () => {
+  const controller = new SessionsController();
+  const request = (origin, site) => ({
+    get: header => ({ origin, 'sec-fetch-site': site, host: 'pricepulse.internal' })[header],
+  });
+  const destination = { targetUrl: 'https://example.org' };
+  await assert.rejects(controller.startRemoteBrowser('jd', destination, request('https://example.org', 'cross-site')), {
+    status: 403,
+  });
+  await assert.rejects(controller.startRemoteBrowser('jd', destination, request('https://pricepulse.example.org', 'same-origin')), {
+    status: 400,
+  });
+});
+
 test('temporary JD failures preserve the session and confirmed expiry sends one notification', async t => {
   const oldDataRoot = process.env.LOCALAPPDATA;
   const testRoot = mkdtempSync(join(tmpdir(), 'pricepulse-test-'));
