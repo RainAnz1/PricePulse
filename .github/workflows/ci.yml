@@ -78,7 +78,7 @@ jobs:
                 const assert = require("node:assert/strict");
                 const { mkdirSync, readlinkSync, symlinkSync } = require("node:fs");
                 const { join } = require("node:path");
-                const { getDataRoot, getJdHeadlessContext, getTaobaoHeadlessContext } = require("./apps/api/dist/sessions");
+                const { getDataRoot, getJdHeadlessContext, getTaobaoHeadlessContext, SessionsController } = require("./apps/api/dist/sessions");
                 const profile = join(getDataRoot(), "PriceDrop", "browser-profiles", "shared-headless");
                 const lock = join(profile, "SingletonLock");
                 mkdirSync(profile, { recursive: true });
@@ -94,6 +94,25 @@ jobs:
                     assert.equal(await page.locator("h1").innerText(), "PricePulse");
                     assert.ok((await page.screenshot()).length > 0);
                     assert.equal(readlinkSync(lock), "old-pricepulse-container-922337");
+                    await page.evaluate(() => {
+                      addEventListener("mousedown", () => { document.body.dataset.pointer = "pressed"; });
+                      addEventListener("mousemove", e => {
+                        if (e.buttons === 1) document.body.dataset.pointer = String(e.clientX);
+                      });
+                      addEventListener("mouseup", () => { document.body.dataset.pointer = "released"; });
+                    });
+                    const controller = new SessionsController();
+                    controller.getPointerPage = () => page;
+                    const pointer = { id: "fixture", x: 20, y: 20 };
+                    const req = { get: () => undefined };
+                    await controller.updateRemotePointer("jd", { ...pointer, type: "down" }, req);
+                    await page.waitForFunction(() => document.body.dataset.pointer === "pressed");
+                    await controller.updateRemotePointer("jd", { ...pointer, type: "move", x: 120 }, req);
+                    await page.waitForFunction(() => document.body.dataset.pointer === "120");
+                    const frame = await controller.captureDragFrame(controller.remotePointers.get("jd"));
+                    assert.match(frame, /^data:image\/jpeg;base64,/);
+                    await controller.updateRemotePointer("jd", { ...pointer, type: "up", x: 120 }, req);
+                    await page.waitForFunction(() => document.body.dataset.pointer === "released");
                   } finally {
                     await jd.close();
                   }

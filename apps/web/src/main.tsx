@@ -693,6 +693,18 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
   );
 }
 
+type RemotePoint = { x: number; y: number };
+
+interface RemotePointerInteraction {
+  id: string;
+  browserPointerId: number;
+  start: RemotePoint;
+  started: boolean;
+  sending: boolean;
+  nextMove?: RemotePoint;
+  end?: { type: 'up' | 'cancel'; point?: RemotePoint };
+}
+
 function RemoteBrowserViewport({
   platform,
   initialFrame,
@@ -708,8 +720,7 @@ function RemoteBrowserViewport({
   const [loading, setLoading] = useState(false);
   const [frameError, setFrameError] = useState(initialFrame?.screenshot ? undefined : initialFrame?.message);
   const [textInput, setTextInput] = useState('');
-  const [dragPoints, setDragPoints] = useState<Array<{ x: number; y: number }>>([]);
-  const isDraggingRef = useRef(false);
+  const pointerRef = useRef<RemotePointerInteraction | null>(null);
   const actionBusyRef = useRef(false);
   const frameBusyRef = useRef(false);
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -732,6 +743,7 @@ function RemoteBrowserViewport({
   }
 
   async function initRemote(resetToLogin = false) {
+    if (pointerRef.current || actionBusyRef.current) return;
     setLoading(true);
     actionBusyRef.current = true;
     try {
@@ -762,33 +774,48 @@ function RemoteBrowserViewport({
     if (!frame?.screenshot) {
       void initRemote(false);
     }
+    let lastPoll = 0;
+    const controller = new AbortController();
     const timer = window.setInterval(async () => {
-      if (isDraggingRef.current || actionBusyRef.current || frameBusyRef.current) return;
+      const interval = pointerRef.current ? 140 : 1350;
+      if (actionBusyRef.current || frameBusyRef.current || Date.now() - lastPoll < interval) return;
+      lastPoll = Date.now();
       frameBusyRef.current = true;
       try {
-        const res = await fetch(`/api/sessions/${platform}/remote/frame`);
+        const res = await fetch(`/api/sessions/${platform}/remote/frame`, {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(12000)]),
+        });
         const data = await readFrame(res);
         if (data.state === 'logged_in') {
           onLoggedIn(data);
           return;
         }
-        if (!actionBusyRef.current && !isDraggingRef.current) {
+        if (!actionBusyRef.current && !controller.signal.aborted) {
           setFrameError(data.screenshot ? undefined : data.message);
           if (data.screenshot) setFrame(data);
         }
       } catch (error) {
         // Retain the last frame while the connection recovers.
-        if (!actionBusyRef.current) {
+        if (!actionBusyRef.current && !controller.signal.aborted) {
           setFrameError(error instanceof Error ? error.message : '暂时无法获取实时画面');
         }
       } finally {
         frameBusyRef.current = false;
       }
-    }, 1350);
-    return () => window.clearInterval(timer);
+    }, 140);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+      const pointer = pointerRef.current;
+      if (pointer && !pointer.end) {
+        pointer.end = { type: 'cancel' };
+        void flushPointer(pointer);
+      }
+    };
   }, [platform]);
 
   async function sendRemoteAction(payload: Record<string, unknown>) {
+    if (pointerRef.current || actionBusyRef.current) return;
     actionBusyRef.current = true;
     setLoading(true);
     try {
@@ -824,48 +851,74 @@ function RemoteBrowserViewport({
     };
   }
 
+  async function sendPointer(id: string, type: 'down' | 'move' | 'up' | 'cancel', point?: RemotePoint) {
+    const response = await fetch(`/api/sessions/${platform}/remote/pointer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, type, ...point }),
+      keepalive: type === 'cancel' || type === 'up',
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({})) as { message?: string };
+      throw new Error(data.message || '鼠标连线失败，请重新按下');
+    }
+  }
+
+  async function flushPointer(pointer: RemotePointerInteraction) {
+    if (pointer.sending) return;
+    pointer.sending = true;
+    try {
+      if (!pointer.started) {
+        await sendPointer(pointer.id, 'down', pointer.start);
+        pointer.started = true;
+      }
+      while (!pointer.end && pointer.nextMove) {
+        const point = pointer.nextMove;
+        pointer.nextMove = undefined;
+        await sendPointer(pointer.id, 'move', point);
+      }
+      if (pointer.end) {
+        await sendPointer(pointer.id, pointer.end.type, pointer.end.point);
+        if (pointerRef.current === pointer) pointerRef.current = null;
+      }
+    } catch (error) {
+      if (pointerRef.current === pointer) pointerRef.current = null;
+      void sendPointer(pointer.id, 'cancel').catch(() => {});
+      onMessage(error instanceof Error ? error.message : '鼠标操作中断，请重试');
+    } finally {
+      pointer.sending = false;
+    }
+  }
+
   function handlePointerDown(e: React.PointerEvent<HTMLDivElement>) {
-    if (!frame?.screenshot || loading) return;
+    if (!frame?.screenshot || actionBusyRef.current || pointerRef.current || !e.isPrimary || e.button !== 0) return;
     e.preventDefault();
-    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-    const pt = clientToVirtual(e.clientX, e.clientY);
-    isDraggingRef.current = true;
-    setDragPoints([pt]);
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const id = Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16).padStart(8, '0')).join('');
+    const pointer: RemotePointerInteraction = {
+      id,
+      browserPointerId: e.pointerId,
+      start: clientToVirtual(e.clientX, e.clientY),
+      started: false,
+      sending: false,
+    };
+    pointerRef.current = pointer;
+    void flushPointer(pointer);
   }
 
   function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
-    if (!isDraggingRef.current) return;
-    const pt = clientToVirtual(e.clientX, e.clientY);
-    setDragPoints(prev => {
-      if (prev.length === 0) return [pt];
-      const last = prev[prev.length - 1];
-      const dist = Math.hypot(pt.x - last.x, pt.y - last.y);
-      if (dist < 10) return prev;
-      return [...prev.slice(-28), pt];
-    });
+    const pointer = pointerRef.current;
+    if (!pointer || pointer.browserPointerId !== e.pointerId || pointer.end) return;
+    pointer.nextMove = clientToVirtual(e.clientX, e.clientY);
+    void flushPointer(pointer);
   }
 
-  function handlePointerUp(e: React.PointerEvent<HTMLDivElement>) {
-    if (!isDraggingRef.current) return;
-    isDraggingRef.current = false;
-    const endPt = clientToVirtual(e.clientX, e.clientY);
-    const pts = [...dragPoints, endPt];
-    setDragPoints([]);
-
-    const startPt = pts[0] || endPt;
-    const totalDist = Math.hypot(endPt.x - startPt.x, endPt.y - startPt.y);
-    if (totalDist < 10) {
-      void sendRemoteAction({ type: 'click', x: endPt.x, y: endPt.y });
-    } else {
-      void sendRemoteAction({
-        type: 'drag',
-        fromX: startPt.x,
-        fromY: startPt.y,
-        toX: endPt.x,
-        toY: endPt.y,
-        path: pts,
-      });
-    }
+  function finishPointer(e: React.PointerEvent<HTMLDivElement>, type: 'up' | 'cancel') {
+    const pointer = pointerRef.current;
+    if (!pointer || pointer.browserPointerId !== e.pointerId || pointer.end) return;
+    pointer.end = { type, point: type === 'up' ? clientToVirtual(e.clientX, e.clientY) : undefined };
+    void flushPointer(pointer);
   }
 
   function handleSendText(e: React.FormEvent) {
@@ -958,7 +1011,9 @@ function RemoteBrowserViewport({
         className="remote-stage-wrap"
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
+        onPointerUp={e => finishPointer(e, 'up')}
+        onPointerCancel={e => finishPointer(e, 'cancel')}
+        onLostPointerCapture={e => finishPointer(e, 'cancel')}
       >
         {frame?.screenshot ? (
           <img
