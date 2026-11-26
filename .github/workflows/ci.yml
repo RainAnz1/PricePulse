@@ -109,7 +109,7 @@ jobs:
                     await page.waitForFunction(() => document.body.dataset.pointer === "pressed");
                     await controller.updateRemotePointer("jd", { ...pointer, type: "move", x: 120 }, req);
                     await page.waitForFunction(() => document.body.dataset.pointer === "120");
-                    const frame = await controller.captureDragFrame(controller.remotePointers.get("jd"));
+                    const frame = await controller.remoteBrowser.screenshot("jd", page);
                     assert.match(frame, /^data:image\/jpeg;base64,/);
                     await controller.updateRemotePointer("jd", { ...pointer, type: "up", x: 120 }, req);
                     await page.waitForFunction(() => document.body.dataset.pointer === "released");
