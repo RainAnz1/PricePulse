@@ -92,6 +92,7 @@ async function bootstrap() {
   const httpsOptions = buildHttpsOptions();
   const app = await NestFactory.create(AppModule, httpsOptions ? { httpsOptions } : undefined);
   app.setGlobalPrefix('api');
+  app.enableShutdownHooks();
 
   const webDistDir = resolveWebDistDir();
   if (webDistDir) {

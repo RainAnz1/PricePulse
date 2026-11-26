@@ -6,6 +6,7 @@ import {
   Get,
   Header,
   InternalServerErrorException,
+  OnModuleDestroy,
   OnModuleInit,
   Param,
   Post,
@@ -952,7 +953,7 @@ async function open(platform: Platform): Promise<BrowserContext> {
 }
 
 @Controller('sessions')
-export class SessionsController implements OnModuleInit {
+export class SessionsController implements OnModuleInit, OnModuleDestroy {
   onModuleInit() {
     if (!keepAliveTimer) {
       // 每 10 分钟在服务端后台执行一次京东与淘宝登录态保活心跳
@@ -962,6 +963,14 @@ export class SessionsController implements OnModuleInit {
       }, 10 * 60 * 1000);
       keepAliveTimer.unref?.();
     }
+  }
+
+  async onModuleDestroy() {
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+    const openContexts = [...contexts.values()];
+    if (headlessAuthContext) openContexts.push(headlessAuthContext);
+    await Promise.allSettled(openContexts.map(context => context.close()));
   }
 
   private async getOrCreateRemotePage(
