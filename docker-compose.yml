@@ -3,11 +3,13 @@ services:
     build: .
     container_name: price-pulse
     restart: unless-stopped
+    init: true
     ports:
-      - "8090:8090"
       - "3001:3001"
     volumes:
       - ./local-data:/app/.local-data
     environment:
       - NODE_ENV=production
+      - HOST=0.0.0.0
+      - PORT=3001
       - TZ=Asia/Shanghai

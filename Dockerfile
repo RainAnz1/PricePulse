@@ -1,4 +1,4 @@
-# Price_drop_one 容器化部署镜像 (支持 Linux 服务器 / 私有云 / 群晖・绿联・飞牛 NAS)
+# PricePulse 容器化部署镜像 (支持 Linux 服务器 / 私有云 / 群晖・绿联・飞牛 NAS)
 FROM node:22-bookworm-slim
 
 WORKDIR /app
@@ -9,25 +9,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-cjk \
     ca-certificates \
     curl \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
-    PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
-    NODE_ENV=production
+    PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 COPY package.json package-lock.json ./
 COPY apps/api/package.json ./apps/api/package.json
 COPY apps/web/package.json ./apps/web/package.json
 
-RUN npm ci --ignore-scripts
+RUN npm ci
 
 COPY . .
 
-RUN npm run build
+RUN npm run build && npm prune --omit=dev
+
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=3001
 
 # 持久化目录：存放登录态 Cookie、监控商品与价格走势历史、飞书配置
 VOLUME ["/app/.local-data"]
 
-EXPOSE 8090 3001
+EXPOSE 3001
 
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "apps/api/dist/main.js"]
