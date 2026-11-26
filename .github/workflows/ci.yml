@@ -74,9 +74,17 @@ jobs:
           for i in $(seq 1 30); do
             if docker exec pricepulse-smoke curl -fsS http://127.0.0.1:3001/api/health | grep -q '"status":"ok"'; then
               docker exec pricepulse-smoke curl -fsS http://127.0.0.1:3001/ | grep -q '<div id="root"></div>'
-              docker exec pricepulse-smoke node -e '
+              docker exec -e LOCALAPPDATA=/tmp/pricepulse-smoke-data pricepulse-smoke node -e '
                 const assert = require("node:assert/strict");
-                const { getJdHeadlessContext, getTaobaoHeadlessContext } = require("./apps/api/dist/sessions");
+                const { mkdirSync, readlinkSync, symlinkSync } = require("node:fs");
+                const { join } = require("node:path");
+                const { getDataRoot, getJdHeadlessContext, getTaobaoHeadlessContext } = require("./apps/api/dist/sessions");
+                const profile = join(getDataRoot(), "PriceDrop", "browser-profiles", "shared-headless");
+                const lock = join(profile, "SingletonLock");
+                mkdirSync(profile, { recursive: true });
+                symlinkSync("old-pricepulse-container-922337", lock);
+                symlinkSync("/tmp/pricepulse-exited-chromium/SingletonSocket", join(profile, "SingletonSocket"));
+                symlinkSync("38024", join(profile, "SingletonCookie"));
                 (async () => {
                   const [jd, taobao] = await Promise.all([getJdHeadlessContext(), getTaobaoHeadlessContext()]);
                   assert.equal(jd, taobao);
@@ -85,6 +93,7 @@ jobs:
                     await page.goto("data:text/html,<h1>PricePulse</h1>");
                     assert.equal(await page.locator("h1").innerText(), "PricePulse");
                     assert.ok((await page.screenshot()).length > 0);
+                    assert.equal(readlinkSync(lock), "old-pricepulse-container-922337");
                   } finally {
                     await jd.close();
                   }

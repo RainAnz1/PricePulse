@@ -13,7 +13,8 @@ import {
   Req,
 } from '@nestjs/common';
 import { chromium, BrowserContext, Page } from 'playwright';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Request } from 'express';
 import { notifySessionExpiredToFeishu } from './feishu';
@@ -473,6 +474,11 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
   return { authenticated, rejected: rejected && !authenticated, pin, nickname, refreshedCookies };
 }
 
+function isChromiumProfileLocked(error: unknown): boolean {
+  return error instanceof Error &&
+    /profile appears to be in use|failed to create a ProcessSingleton/i.test(error.message);
+}
+
 async function launchPersistentContext(profileDir: string): Promise<BrowserContext> {
   mkdirSync(profileDir, { recursive: true });
 
@@ -510,7 +516,6 @@ async function launchPersistentContext(profileDir: string): Promise<BrowserConte
 
   };
 
-  let context: BrowserContext | null = null;
   const candidateBins = [
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
     '/usr/lib/chromium/chromium',
@@ -519,30 +524,54 @@ async function launchPersistentContext(profileDir: string): Promise<BrowserConte
     '/usr/bin/google-chrome',
   ].filter((p): p is string => Boolean(p && existsSync(p)));
 
-  for (const executablePath of candidateBins) {
+  let nativeError: unknown;
+  for (const executablePath of new Set(candidateBins)) {
     try {
-      context = await chromium.launchPersistentContext(profileDir, {
-        ...baseOptions,
-        executablePath,
-      });
-      break;
-    } catch {
-      // Try the next available executable.
+      return await chromium.launchPersistentContext(profileDir, { ...baseOptions, executablePath });
+    } catch (error) {
+      if (isChromiumProfileLocked(error)) throw error;
+      nativeError ??= error;
     }
   }
 
-  if (!context) {
+  try {
+    return await chromium.launchPersistentContext(profileDir, { ...baseOptions, channel: 'chrome' });
+  } catch (error) {
+    if (isChromiumProfileLocked(error)) throw error;
     try {
-      context = await chromium.launchPersistentContext(profileDir, {
-        ...baseOptions,
-        channel: 'chrome',
-      });
-    } catch {
-      context = await chromium.launchPersistentContext(profileDir, baseOptions);
+      return await chromium.launchPersistentContext(profileDir, baseOptions);
+    } catch (fallbackError) {
+      if (isChromiumProfileLocked(fallbackError)) throw fallbackError;
+      throw nativeError ?? fallbackError;
     }
   }
+}
 
-  return context;
+async function launchSharedBrowser(profileDir: string): Promise<BrowserContext> {
+  try {
+    return await launchPersistentContext(profileDir);
+  } catch (error) {
+    if (!isChromiumProfileLocked(error)) throw error;
+  }
+
+  // A replaced container can leave a lock owned by another hostname. Use an
+  // isolated profile so an existing browser's lock and data are left intact.
+  const temporaryProfile = mkdtempSync(join(tmpdir(), 'pricepulse-chromium-'));
+  const cleanup = () => {
+    try {
+      rmSync(temporaryProfile, { recursive: true, force: true });
+    } catch {
+      // A cleanup error must not interrupt browser shutdown.
+    }
+  };
+  try {
+    const context = await launchPersistentContext(temporaryProfile);
+    context.once('close', cleanup);
+    return context;
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
 }
 
 async function restorePlatformCookies(context: BrowserContext, platform: Platform): Promise<void> {
@@ -584,7 +613,7 @@ async function getSharedHeadlessContext(): Promise<BrowserContext> {
 
   const task = (async () => {
     const profileDir = getSharedHeadlessProfilePath();
-    const context = await launchPersistentContext(profileDir);
+    const context = await launchSharedBrowser(profileDir);
     try {
       await ensureJdContextCookies(context);
       await ensureTaobaoContextCookies(context);
@@ -1029,7 +1058,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    const buf = url ? await page.screenshot({ type: 'jpeg', quality: 78, timeout: 3500 }).catch(() => null) : null;
+    const buf = url ? await page.screenshot({ type: 'jpeg', quality: 78, timeout: 6500 }).catch(() => null) : null;
     const screenshot = buf ? `data:image/jpeg;base64,${buf.toString('base64')}` : '';
     const title = url ? await page.title().catch(() => '') : '';
 
@@ -1789,7 +1818,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     };
     activeTaobaoQrSession = attempt;
     const page = await this.getOrCreateRemotePage('taobao', { keepCurrent: false });
-    const qrSelector = '#qrcode-img canvas:visible, #qrcode-img img:visible, .qrcode-img canvas:visible';
+    const qrSelector = '.qrcode-img canvas, .qrcode-img img, #qrcode-img canvas, #qrcode-img img';
     const onResponse = async (res: { url: () => string; json: () => Promise<unknown> }) => {
       const url = platformUrl(res.url(), 'taobao');
       if (!url?.pathname.endsWith('/qrCode/query.do') || activeTaobaoQrSession !== attempt) return;
@@ -1806,13 +1835,46 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     try {
       const switchAccount = page.getByText(/^(使用其他账号登录|其他账号登录)$/).filter({ visible: true }).first();
       if (await switchAccount.isVisible()) await switchAccount.click({ timeout: 2500 });
-      const qr = page.locator(qrSelector).first();
-      await qr.waitFor({ state: 'visible', timeout: 8000 });
-      const png = await qr.screenshot({ type: 'png', timeout: 3500 });
+      const readyQr = await page.waitForFunction((selector): Element | null => {
+        for (const element of document.querySelectorAll(selector)) {
+          const rect = element.getBoundingClientRect();
+          if (rect.width < 90 || rect.height < 90 || getComputedStyle(element).visibility !== 'visible') continue;
+          if (element instanceof HTMLImageElement && element.complete && element.naturalWidth > 0) {
+            return element;
+          }
+          if (!(element instanceof HTMLCanvasElement) || !element.width || !element.height) continue;
+          try {
+            const pixels = element.getContext('2d')
+              ?.getImageData(0, 0, element.width, element.height).data;
+            if (pixels?.some((value, index) => index % 4 === 3 && value > 0 && pixels[index - 3] < 96)) {
+              return element;
+            }
+          } catch {
+            // A canvas with cross-origin content can still be captured as an element.
+            return element;
+          }
+        }
+        return null;
+      }, qrSelector, { timeout: 20000, polling: 250 });
+      let qrImage: string;
+      try {
+        const qr = readyQr.asElement();
+        if (!qr) throw new Error('淘宝二维码尚未绘制');
+        const image = await qr.evaluate(element => {
+          try {
+            return element instanceof HTMLCanvasElement ? element.toDataURL('image/png') : '';
+          } catch {
+            return '';
+          }
+        });
+        qrImage = image || `data:image/png;base64,${(await qr.screenshot({ type: 'png', timeout: 8000 })).toString('base64')}`;
+      } finally {
+        await readyQr.dispose();
+      }
       if (activeTaobaoQrSession !== attempt) throw new Error('二维码已更新');
       return {
         state: 'qr_ready',
-        qrImage: `data:image/png;base64,${png.toString('base64')}`,
+        qrImage,
         expiresAt: new Date(attempt.expiresAt).toISOString(),
         message: '请打开手机淘宝 App 扫描下方二维码登录',
       };

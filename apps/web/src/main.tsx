@@ -706,6 +706,7 @@ function RemoteBrowserViewport({
 }) {
   const [frame, setFrame] = useState<RemoteBrowserFrame | null>(initialFrame);
   const [loading, setLoading] = useState(false);
+  const [frameError, setFrameError] = useState(initialFrame?.screenshot ? undefined : initialFrame?.message);
   const [textInput, setTextInput] = useState('');
   const [dragPoints, setDragPoints] = useState<Array<{ x: number; y: number }>>([]);
   const isDraggingRef = useRef(false);
@@ -719,8 +720,16 @@ function RemoteBrowserViewport({
   useEffect(() => {
     if (initialFrame?.screenshot) {
       setFrame(initialFrame);
+      setFrameError(undefined);
     }
   }, [initialFrame]);
+
+  async function readFrame(response: Response): Promise<RemoteBrowserFrame & PlatformSessionInfo> {
+    if (response.status >= 500) throw new Error('服务端暂时无法启动实时画面，请稍后重试');
+    const data = (await response.json()) as RemoteBrowserFrame & PlatformSessionInfo;
+    if (!response.ok) throw new Error(data.message || '无法获取实时画面');
+    return data;
+  }
 
   async function initRemote(resetToLogin = false) {
     setLoading(true);
@@ -731,15 +740,18 @@ function RemoteBrowserViewport({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keepCurrent: !resetToLogin }),
       });
-      const data = (await res.json()) as RemoteBrowserFrame & PlatformSessionInfo;
+      const data = await readFrame(res);
       if (data.state === 'logged_in') {
         onLoggedIn(data);
         return;
       }
       setFrame(data);
+      setFrameError(data.screenshot ? undefined : data.message);
       if (data.message) onMessage(data.message);
-    } catch {
-      onMessage('无法连接云端实时浏览器画面');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '无法连接云端实时浏览器画面';
+      setFrameError(message);
+      onMessage(message);
     } finally {
       setLoading(false);
       actionBusyRef.current = false;
@@ -755,17 +767,20 @@ function RemoteBrowserViewport({
       frameBusyRef.current = true;
       try {
         const res = await fetch(`/api/sessions/${platform}/remote/frame`);
-        if (!res.ok) return;
-        const data = (await res.json()) as RemoteBrowserFrame & PlatformSessionInfo;
+        const data = await readFrame(res);
         if (data.state === 'logged_in') {
           onLoggedIn(data);
           return;
         }
-        if (data.screenshot && !actionBusyRef.current && !isDraggingRef.current) {
-          setFrame(data);
+        if (!actionBusyRef.current && !isDraggingRef.current) {
+          setFrameError(data.screenshot ? undefined : data.message);
+          if (data.screenshot) setFrame(data);
         }
-      } catch {
+      } catch (error) {
         // Retain the last frame while the connection recovers.
+        if (!actionBusyRef.current) {
+          setFrameError(error instanceof Error ? error.message : '暂时无法获取实时画面');
+        }
       } finally {
         frameBusyRef.current = false;
       }
@@ -782,16 +797,15 @@ function RemoteBrowserViewport({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = (await res.json()) as RemoteBrowserFrame & PlatformSessionInfo;
+      const data = await readFrame(res);
       if (data.state === 'logged_in') {
         onLoggedIn(data);
         return;
       }
-      if (data.screenshot) {
-        setFrame(data);
-      }
-    } catch {
-      // ignore
+      setFrameError(data.screenshot ? undefined : data.message);
+      if (data.screenshot) setFrame(data);
+    } catch (error) {
+      setFrameError(error instanceof Error ? error.message : '实时操作失败，请重试');
     } finally {
       setLoading(false);
       actionBusyRef.current = false;
@@ -867,7 +881,7 @@ function RemoteBrowserViewport({
       <div className="remote-browser-toolbar">
         <div className="remote-url-pill" title={frame?.url || ''}>
           <span className="remote-live-dot" />
-          <span className="sf-mono">{frame?.url || '正在连接云端浏览器画面…'}</span>
+          <span className="sf-mono">{frame?.url || (frameError && !loading ? '实时画面暂不可用' : '正在连接云端浏览器画面…')}</span>
         </div>
         <div className="remote-tool-btns">
           <button
@@ -955,7 +969,9 @@ function RemoteBrowserViewport({
             draggable={false}
           />
         ) : (
-          <div className="remote-stage-empty">正在加载服务端 Chromium 实时画面…</div>
+          <div className="remote-stage-empty">
+            {loading ? '正在加载服务端 Chromium 实时画面…' : frameError || '正在获取实时画面…'}
+          </div>
         )}
       </div>
     </div>
