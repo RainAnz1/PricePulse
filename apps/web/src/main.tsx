@@ -1333,7 +1333,9 @@ function App() {
     setBusy(true);
     setResult('');
     try {
-      const response = await fetch('/api/products/parse?url=' + encodeURIComponent(url));
+      const response = await fetch('/api/products/parse?url=' + encodeURIComponent(url), {
+        signal: AbortSignal.timeout(60000),
+      });
       const data = (await response.json()) as MonitoredProduct & { message?: string };
       if (!response.ok) throw new Error(data.message || '商品链接识别或抓取失败');
       setResult(`${data.platformLabel || data.platform} · ${data.title.slice(0, 34)} — ${data.message}`);
@@ -1349,7 +1351,9 @@ function App() {
       setSelectedKey(data.key);
       setUrl('');
     } catch (error) {
-      setResult(error instanceof Error ? error.message : '服务未连接');
+      setResult(error instanceof Error && error.name === 'TimeoutError'
+        ? '服务器未在 60 秒内完成采集，请稍后重试'
+        : error instanceof Error ? error.message : '服务未连接');
     } finally {
       setBusy(false);
     }
@@ -1358,7 +1362,9 @@ function App() {
   async function refreshProduct(item: MonitoredProduct) {
     setProductActionBusy(item.key);
     try {
-      const res = await fetch(`/api/products/${encodeURIComponent(item.id)}/refresh`, { method: 'POST' });
+      const res = await fetch(`/api/products/${encodeURIComponent(item.key)}/refresh`, {
+        method: 'POST', signal: AbortSignal.timeout(60000),
+      });
       const data = (await res.json()) as { product?: MonitoredProduct; message?: string };
       if (!res.ok) throw new Error(data.message || '刷新失败');
       if (data.product) {
@@ -1367,7 +1373,9 @@ function App() {
       }
       if (data.message) setResult(data.message);
     } catch (err) {
-      setResult(err instanceof Error ? err.message : '刷新商品价格失败');
+      setResult(err instanceof Error && err.name === 'TimeoutError'
+        ? '服务器未在 60 秒内完成刷新，请稍后重试'
+        : err instanceof Error ? err.message : '刷新商品价格失败');
     } finally {
       setProductActionBusy('');
     }

@@ -1059,6 +1059,14 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     return pointer.capture;
   }
 
+  private async closeCompletedLoginPage(platform: Platform, page: Page | null) {
+    if (!page) return;
+    // Keep the shared context and its cookies alive while releasing the login tab.
+    await page.close().catch(() => {});
+    if (platform === 'jd' && headlessLoginPage === page) headlessLoginPage = null;
+    if (platform === 'taobao' && headlessTbPage === page) headlessTbPage = null;
+  }
+
   private async captureRemoteFrameAndCheckAuth(
     platform: Platform,
     source: 'qrcode' | 'sms' = 'qrcode',
@@ -1074,6 +1082,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
       const saved = await syncCookiesFromHeadlessContext({}, source, { mobile });
       if (saved) {
         activeJdQrSession = null;
+        await this.closeCompletedLoginPage('jd', page);
         return this.jdSessionResponse({
           state: 'logged_in', session: saved, message: `京东登录成功（账号：${saved.nickname}）`,
         });
@@ -1084,6 +1093,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
       const saved = await syncTaobaoCookiesFromHeadlessContext({}, source, mobile);
       if (saved) {
         activeTaobaoQrSession = null;
+        await this.closeCompletedLoginPage('taobao', page);
         return {
           state: 'logged_in',
           code: 200,
@@ -1686,6 +1696,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
         activeJdQrSession = null;
 
         if (!saved) return this.captureRemoteFrameAndCheckAuth('jd');
+        await this.closeCompletedLoginPage('jd', headlessLoginPage);
 
         return {
           state: 'logged_in',

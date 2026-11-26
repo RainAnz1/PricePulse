@@ -5,6 +5,8 @@ const { join } = require('node:path');
 const { test } = require('node:test');
 const { readJdDisplayedPrice, resolveJdPrice } = require('./dist/jd-price');
 const { saveFeishuConfig } = require('./dist/feishu');
+const { scrapeAndUpsertProduct } = require('./dist/products');
+const sessionModule = require('./dist/sessions');
 const {
   SessionsController,
   loadPersistedJdSession,
@@ -86,4 +88,27 @@ test('temporary JD failures preserve the session and confirmed expiry sends one 
   assert.equal((await new SessionsController().getTaobaoStatus()).state, 'login_required');
   savePersistedTaobaoSession({ cookies: { sgcookie: 'fixture', tracknick: 'test' } });
   assert.equal((await new SessionsController().getTaobaoStatus()).state, 'logged_in');
+});
+
+test('product collection shares the same SKU job and blocks concurrent browser pages', async t => {
+  let markStarted;
+  let failBrowser;
+  const started = new Promise(resolve => { markStarted = resolve; });
+  const browser = new Promise((_, reject) => { failBrowser = reject; });
+  const launch = t.mock.method(sessionModule, 'getTaobaoHeadlessContext', () => {
+    markStarted();
+    return browser;
+  });
+  const item = 'https://item.taobao.com/item.htm?id=123456&skuId=4321';
+  const first = scrapeAndUpsertProduct(item + '&pvid=fixture');
+  await started;
+  const duplicate = scrapeAndUpsertProduct(item + '&utparam=fixture');
+  const results = Promise.allSettled([first, duplicate]);
+  await assert.rejects(scrapeAndUpsertProduct(item.replace('4321', '2345')), { status: 503 });
+  assert.equal(launch.mock.callCount(), 1);
+  failBrowser(new Error('fixture browser stopped'));
+  assert.deepEqual((await results).map(result => result.reason.status), [400, 400]);
+
+  await assert.rejects(scrapeAndUpsertProduct(item), { status: 400 });
+  assert.equal(launch.mock.callCount(), 2);
 });

@@ -130,6 +130,7 @@ export async function resolveAndParseProductUrl(rawInput?: string): Promise<Prod
       const res = await fetch(candidate, {
         method: 'GET',
         redirect: 'follow',
+        signal: AbortSignal.timeout(10000),
         headers: {
           'User-Agent':
             'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',

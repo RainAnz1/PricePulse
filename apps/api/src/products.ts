@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   ForbiddenException,
+  GatewayTimeoutException,
   Get,
   NotFoundException,
   OnModuleInit,
@@ -10,10 +11,12 @@ import {
   Post,
   Query,
   Req,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Request } from 'express';
+import type { Page } from 'playwright';
 import { ProductIdentity, resolveAndParseProductUrl } from './product-url';
 import {
   getDataRoot,
@@ -379,13 +382,22 @@ interface JdPcRichDetail {
   htmlText: string;
 }
 
-async function scrapeJdPcRichDetail(skuId: string): Promise<JdPcRichDetail | null> {
+function closeProductPageOnTimeout(page: Page, signal: AbortSignal): () => void {
+  const close = () => { void page.close().catch(() => {}); };
+  signal.addEventListener('abort', close, { once: true });
+  return () => signal.removeEventListener('abort', close);
+}
+
+async function scrapeJdPcRichDetail(skuId: string, signal: AbortSignal): Promise<JdPcRichDetail | null> {
   try {
     const context = await getJdHeadlessContext();
+    signal.throwIfAborted();
     const page = await context.newPage();
+    const detachTimeout = closeProductPageOnTimeout(page, signal);
     let wareBusinessRaw = '';
 
     try {
+      signal.throwIfAborted();
       await page.route('**/pc-frequent-pro.pf.jd.com/**', route => route.abort()).catch(() => {});
       await page.route('**/cfe.m.jd.com/**', route => route.abort()).catch(() => {});
 
@@ -590,6 +602,7 @@ async function scrapeJdPcRichDetail(skuId: string): Promise<JdPcRichDetail | nul
         };
       }
     } finally {
+      detachTimeout();
       await page.close().catch(() => {});
     }
   } catch {
@@ -598,7 +611,7 @@ async function scrapeJdPcRichDetail(skuId: string): Promise<JdPcRichDetail | nul
   return null;
 }
 
-async function scrapeJdProduct(identity: ProductIdentity): Promise<{
+async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSignal): Promise<{
   title: string;
   imageUrl: string;
   shopName: string;
@@ -622,7 +635,7 @@ async function scrapeJdProduct(identity: ProductIdentity): Promise<{
   const mobileUrl = `https://item.m.jd.com/product/${skuId}.html`;
 
   const res = await fetch(mobileUrl, {
-    signal: AbortSignal.timeout(12000),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(12000)]),
     headers: {
       'User-Agent': MOBILE_UA,
       Referer: 'https://m.jd.com/',
@@ -696,7 +709,7 @@ async function scrapeJdProduct(identity: ProductIdentity): Promise<{
     parseCleanNumericPrice(itemInfo.priceFloor?.price);
 
   // 通过服务端无头浏览器采集 PC 详情页的真实「国补领后价 / 到手价」「日常标价」与「国家补贴立减金额」
-  const pcRich = await scrapeJdPcRichDetail(skuId);
+  const pcRich = await scrapeJdPcRichDetail(skuId, signal);
   if (pcRich?.title && title.startsWith('京东商品 #')) title = pcRich.title;
   if (pcRich?.shopName && shopName === '京东自营 / 官方旗舰店') shopName = pcRich.shopName;
   if (pcRich?.spec && spec === '默认规格') spec = pcRich.spec;
@@ -903,7 +916,7 @@ function parseTaobaoMtopJson(rawText: string, targetSkuId: string | null): Parti
   }
 }
 
-async function scrapeTaobaoProduct(identity: ProductIdentity) {
+async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSignal) {
   const isTmall = Boolean(identity.isTmall || identity.canonicalUrl.includes('tmall.com'));
   const defaultShop = isTmall ? '天猫官方旗舰店' : '淘宝店铺';
   const defaultSpec = identity.skuId ? `规格 ${identity.skuId}` : '默认规格';
@@ -925,9 +938,12 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
 
   try {
     const context = await getTaobaoHeadlessContext();
+    signal.throwIfAborted();
     const page = await context.newPage();
+    const detachTimeout = closeProductPageOnTimeout(page, signal);
 
     try {
+      signal.throwIfAborted();
       const mtopPayloads: string[] = [];
       page.on('response', async res => {
         const u = res.url();
@@ -951,10 +967,10 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
         }
       });
 
-      const urlsToTry = [
+      const urlsToTry = new Set([
         identity.canonicalUrl,
         `https://item.taobao.com/item.htm?id=${identity.id}${identity.skuId ? `&skuId=${identity.skuId}` : ''}`,
-      ];
+      ]);
 
       for (const targetUrl of urlsToTry) {
         await page
@@ -965,6 +981,7 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
           .catch(() => {});
 
         let loginTicksWithoutQuickBtn = 0;
+        let quickLoginClicked = false;
 
         for (let i = 0; i < 24; i++) {
           await page.waitForTimeout(300);
@@ -976,10 +993,11 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
           const curUrl = page.url();
           if (curUrl.includes('login.taobao.com') || curUrl.includes('login.m.taobao.com')) {
             redirectedToLogin = true;
+            if (quickLoginClicked) continue;
             const loginState = await page
               .evaluate(() => {
                 const btn = document.querySelector(
-                  '.has-login button, .has-login .fm-button, button.fm-button',
+                  '.has-login button, .has-login .fm-button',
                 ) as HTMLButtonElement | null;
                 if (btn && (btn.textContent || '').includes('登录')) {
                   btn.click();
@@ -990,6 +1008,7 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
               })
               .catch(() => 'navigating');
 
+            quickLoginClicked = loginState === 'clicked_has_login';
             if (loginState === 'need_manual_login') {
               loginTicksWithoutQuickBtn++;
               if (loginTicksWithoutQuickBtn >= 6) {
@@ -1190,6 +1209,7 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
         }
       }
     } finally {
+      detachTimeout();
       await page.close().catch(() => {});
     }
   } catch {
@@ -1234,22 +1254,51 @@ async function scrapeTaobaoProduct(identity: ProductIdentity) {
   };
 }
 
-export async function scrapeAndUpsertProduct(rawUrl?: string): Promise<{
+interface ProductScrapeResult {
   product: MonitoredProduct;
   isNew: boolean;
   priceDropped: boolean;
   feishuPushed: boolean;
-}> {
+}
+
+let activeScrape: { key: string; response: Promise<ProductScrapeResult> } | undefined;
+
+export async function scrapeAndUpsertProduct(rawUrl?: string): Promise<ProductScrapeResult> {
   const identity = await resolveAndParseProductUrl(rawUrl);
   const key = `${identity.platform}:${identity.id}:${identity.skuId || 'default'}`;
+  if (activeScrape) {
+    if (activeScrape.key === key) return activeScrape.response;
+    throw new ServiceUnavailableException('服务端正在采集另一个商品，请稍后重试');
+  }
+
+  const signal = AbortSignal.timeout(45000);
+  let onTimeout: () => void;
+  const timeout = new Promise<never>((_, reject) => {
+    onTimeout = () => reject(new GatewayTimeoutException('商品详情采集超时，请稍后重试'));
+    signal.addEventListener('abort', onTimeout, { once: true });
+  });
+  const work = scrapeAndSaveProduct(identity, key, signal);
+  const response = Promise.race([work, timeout]);
+  activeScrape = { key, response };
+  // Keep the browser slot occupied until the timed-out page has closed.
+  void work.finally(() => {
+    signal.removeEventListener('abort', onTimeout);
+    if (activeScrape?.response === response) activeScrape = undefined;
+  }).catch(() => {});
+  return response;
+}
+
+async function scrapeAndSaveProduct(
+  identity: ProductIdentity, key: string, signal: AbortSignal,
+): Promise<ProductScrapeResult> {
+  const scraped =
+    identity.platform === 'jd'
+      ? await scrapeJdProduct(identity, signal)
+      : await scrapeTaobaoProduct(identity, signal);
+  signal.throwIfAborted();
   const products = loadMonitoredProducts();
   const existingIdx = products.findIndex(p => p.key === key);
   const existing = existingIdx >= 0 ? products[existingIdx] : null;
-
-  const scraped =
-    identity.platform === 'jd'
-      ? await scrapeJdProduct(identity)
-      : await scrapeTaobaoProduct(identity);
 
   const nowIso = new Date().toISOString();
   const newPoint: PriceHistoryPoint = {

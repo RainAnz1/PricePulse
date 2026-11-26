@@ -145,6 +145,7 @@ export async function sendFeishuCard(card: Record<string, unknown>, force = fals
 
   try {
     const res = await fetch(config.webhookUrl, {
+      signal: AbortSignal.timeout(6000),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
