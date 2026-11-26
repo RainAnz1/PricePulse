@@ -944,6 +944,12 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
 
     try {
       signal.throwIfAborted();
+      page.on('popup', popup => { void popup.close().catch(() => {}); });
+      // Product collection needs the price text and image URLs, with no need to download media.
+      await page.route('**/*', route => {
+        const type = route.request().resourceType();
+        return type === 'image' || type === 'media' || type === 'font' ? route.abort() : route.fallback();
+      });
       const mtopPayloads: string[] = [];
       page.on('response', async res => {
         const u = res.url();
@@ -1025,12 +1031,11 @@ async function scrapeTaobaoProduct(identity: ProductIdentity, signal: AbortSigna
                 Boolean(document.getElementById('a-link')) &&
                 !document.querySelector('h1, [class*="mainTitle"], [class*="ItemTitle"], [class*="Price--"]');
               if (isJumpShell) return 'jump_shell';
-              const hasRenderedDetail = Boolean(
-                document.querySelector(
-                  'h1, [class*="mainTitle"], [class*="ItemTitle"], [class*="ItemHeader--mainTitle"], [class*="Price--"], .tb-rmb-num, .tm-price',
-                ),
+              const priceElements = document.querySelectorAll(
+                '[class*="highlightPrice"] [class*="priceText"], [class*="Price--priceText"], .tb-rmb-num, .tm-price',
               );
-              return hasRenderedDetail ? 'detail_ready' : 'loading';
+              const priceReady = Array.from(priceElements).some(el => /\d/.test(el.textContent || ''));
+              return priceReady ? 'detail_ready' : 'loading';
             })
             .catch(() => 'loading');
 

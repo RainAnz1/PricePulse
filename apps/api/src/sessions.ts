@@ -611,11 +611,31 @@ export function ensureTaobaoContextCookies(context: BrowserContext): Promise<voi
   return restorePlatformCookies(context, 'taobao');
 }
 
+let headlessIdleTimer: NodeJS.Timeout | undefined;
+let headlessAuthClosing: Promise<void> | null = null;
+
+function scheduleHeadlessIdleClose(context: BrowserContext) {
+  if (headlessAuthContext !== context || headlessAuthClosing) return;
+  clearTimeout(headlessIdleTimer);
+  const hasOpenPage = () => context.pages().some(page => !page.isClosed() && page.url() !== 'about:blank');
+  if (hasOpenPage()) return;
+
+  headlessIdleTimer = setTimeout(() => {
+    if (headlessAuthContext !== context || hasOpenPage()) return;
+    headlessAuthClosing = context.close().catch(() => {}).finally(() => {
+      headlessAuthClosing = null;
+    });
+  }, 15000);
+  headlessIdleTimer.unref();
+}
+
 /**
  * 全局共享单例无头浏览器上下文（京东与淘宝共用同一个 Chromium 实例与不同 Tab，彻底避免多实例 Crashpad 锁死与内存翻倍）
  */
 async function getSharedHeadlessContext(): Promise<BrowserContext> {
+  if (headlessAuthClosing) await headlessAuthClosing;
   if (headlessAuthContext) {
+    scheduleHeadlessIdleClose(headlessAuthContext);
     return headlessAuthContext;
   }
   if (headlessAuthLaunching) return headlessAuthLaunching;
@@ -632,13 +652,20 @@ async function getSharedHeadlessContext(): Promise<BrowserContext> {
     }
 
     headlessAuthContext = context;
+    for (const page of context.pages()) page.once('close', () => scheduleHeadlessIdleClose(context));
+    context.on('page', page => {
+      clearTimeout(headlessIdleTimer);
+      page.once('close', () => scheduleHeadlessIdleClose(context));
+    });
     context.on('close', () => {
       if (headlessAuthContext === context) {
+        clearTimeout(headlessIdleTimer);
         headlessAuthContext = null;
         headlessLoginPage = null;
         headlessTbPage = null;
       }
     });
+    scheduleHeadlessIdleClose(context);
     return context;
   })();
 
@@ -1008,6 +1035,8 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy() {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
     keepAliveTimer = null;
+    clearTimeout(headlessIdleTimer);
+    if (headlessAuthClosing) await headlessAuthClosing;
     for (const pointer of this.remotePointers.values()) clearTimeout(pointer.timeout);
     this.remotePointers.clear();
     const openContexts = [...contexts.values()];

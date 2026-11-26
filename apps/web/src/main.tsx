@@ -1135,7 +1135,10 @@ function App() {
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch('/api/health', { signal: controller.signal })
+    const load = (path: string, timeout = 10000) => fetch(path, {
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(timeout)]),
+    });
+    load('/api/health')
       .then(response => {
         if (!response.ok) throw new Error('API unavailable');
         return response.json();
@@ -1145,17 +1148,24 @@ function App() {
         if (error.name !== 'AbortError') setStatus('未连接');
       });
 
-    fetch('/api/products', { signal: controller.signal })
-      .then(res => (res.ok ? res.json() : null))
+    load('/api/products')
+      .then(res => {
+        if (!res.ok) throw new Error('无法读取商品列表');
+        return res.json();
+      })
       .then((data: { products?: MonitoredProduct[] } | null) => {
         if (data?.products) {
           setProducts(data.products);
           if (data.products[0]) setSelectedKey(data.products[0].key);
         }
       })
-      .catch(() => {});
+      .catch((error: Error) => {
+        if (error.name !== 'AbortError') {
+          setResult(previous => previous || '商品列表暂时无法加载，请稍后刷新页面');
+        }
+      });
 
-    fetch('/api/sessions/jd/status', { signal: controller.signal })
+    load('/api/sessions/jd/status', 18000)
       .then(res => (res.ok ? res.json() : null))
       .then((data: PlatformSessionInfo | null) => {
         if (data) {
@@ -1171,7 +1181,7 @@ function App() {
       })
       .catch(() => {});
 
-    fetch('/api/sessions/taobao/status', { signal: controller.signal })
+    load('/api/sessions/taobao/status')
       .then(res => (res.ok ? res.json() : null))
       .then((data: PlatformSessionInfo | null) => {
         if (data) {
@@ -1188,7 +1198,7 @@ function App() {
       })
       .catch(() => {});
 
-    fetch('/api/feishu/config', { signal: controller.signal })
+    load('/api/feishu/config')
       .then(res => (res.ok ? res.json() : null))
       .then((data: FeishuConfigState | null) => {
         if (data) {
@@ -1353,7 +1363,8 @@ function App() {
     } catch (error) {
       setResult(error instanceof Error && error.name === 'TimeoutError'
         ? '服务器未在 60 秒内完成采集，请稍后重试'
-        : error instanceof Error ? error.message : '服务未连接');
+        : error instanceof TypeError ? '暂时无法连接 PricePulse 服务器，请稍后重试'
+          : error instanceof Error ? error.message : '服务未连接');
     } finally {
       setBusy(false);
     }
@@ -1375,7 +1386,8 @@ function App() {
     } catch (err) {
       setResult(err instanceof Error && err.name === 'TimeoutError'
         ? '服务器未在 60 秒内完成刷新，请稍后重试'
-        : err instanceof Error ? err.message : '刷新商品价格失败');
+        : err instanceof TypeError ? '暂时无法连接 PricePulse 服务器，请稍后重试'
+          : err instanceof Error ? err.message : '刷新商品价格失败');
     } finally {
       setProductActionBusy('');
     }
