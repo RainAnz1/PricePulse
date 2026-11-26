@@ -383,13 +383,41 @@ interface JdPcRichDetail {
   htmlText: string;
 }
 
+const jdCollectionMessages = {
+  JD_RATE_LIMITED: '京东限制了商品页的访问频率，暂时无法读取价格。账号保活成功时也可能遇到商品页频控。',
+  JD_VERIFICATION_REQUIRED: '京东商品页要求完成平台安全验证，暂时无法读取价格。',
+  JD_LOGIN_REQUIRED: '京东商品页跳转到了登录页面，请重新扫码登录后重试。',
+  JD_PRICE_ACCESS_DENIED: '京东拒绝了商品价格接口的请求，暂时无法读取价格。',
+  JD_PRICE_UNAVAILABLE: '京东商品页没有返回可识别的价格，请稍后重试。',
+} as const;
+type JdCollectionCode = keyof typeof jdCollectionMessages;
+
+function jdProductPageIssue(url: string): JdCollectionCode | null {
+  if (!URL.canParse(url)) return null;
+  const { hostname, pathname } = new URL(url);
+  if (hostname === 'pc-frequent-pro.pf.jd.com' ||
+      (hostname === 'trade.m.jd.com' && pathname === '/common/limit.html')) {
+    return 'JD_RATE_LIMITED';
+  }
+  if (hostname === 'aq.jd.com' || hostname === 'safe.jd.com' || hostname === 'cfe.m.jd.com') {
+    return 'JD_VERIFICATION_REQUIRED';
+  }
+  if (hostname === 'passport.jd.com' || hostname === 'plogin.m.jd.com') {
+    return 'JD_LOGIN_REQUIRED';
+  }
+  return null;
+}
+
 function closeProductPageOnTimeout(page: Page, signal: AbortSignal): () => void {
   const close = () => { void page.close().catch(() => {}); };
   signal.addEventListener('abort', close, { once: true });
   return () => signal.removeEventListener('abort', close);
 }
 
-async function scrapeJdPcRichDetail(skuId: string, signal: AbortSignal): Promise<JdPcRichDetail | null> {
+async function scrapeJdPcRichDetail(
+  skuId: string, signal: AbortSignal,
+): Promise<JdPcRichDetail | JdCollectionCode | null> {
+  let priceApiIssue: JdCollectionCode | null = null;
   try {
     const context = await getJdHeadlessContext();
     signal.throwIfAborted();
@@ -399,12 +427,11 @@ async function scrapeJdPcRichDetail(skuId: string, signal: AbortSignal): Promise
 
     try {
       signal.throwIfAborted();
-      await page.route('**/pc-frequent-pro.pf.jd.com/**', route => route.abort()).catch(() => {});
-      await page.route('**/cfe.m.jd.com/**', route => route.abort()).catch(() => {});
-
       page.on('response', async res => {
         const u = res.url();
         if (u.includes('pc_detailpage_wareBusiness')) {
+          if (res.status() === 429) priceApiIssue = 'JD_RATE_LIMITED';
+          else if (res.status() === 403 && !priceApiIssue) priceApiIssue = 'JD_PRICE_ACCESS_DENIED';
           try {
             const text = await res.text();
             if (text && text.trim().startsWith('{')) {
@@ -422,6 +449,8 @@ async function scrapeJdPcRichDetail(skuId: string, signal: AbortSignal): Promise
       });
 
       for (let i = 0; i < 14; i++) {
+        const issue = jdProductPageIssue(page.url());
+        if (issue) return issue;
         await page.waitForTimeout(250);
         const hasDomPrice = await page
           .evaluate((id: string) => {
@@ -435,6 +464,8 @@ async function scrapeJdPcRichDetail(skuId: string, signal: AbortSignal): Promise
         if (hasDomPrice && (wareBusinessRaw || i >= 5)) break;
       }
 
+      const pageIssue = jdProductPageIssue(page.url());
+      if (pageIssue) return pageIssue;
       const domExtracted = await page.evaluate((id: string) => {
         const clean = (s?: string | null) => (s || '').replace(/\s+/g, ' ').trim();
         const priceWrapEl =
@@ -607,9 +638,9 @@ async function scrapeJdPcRichDetail(skuId: string, signal: AbortSignal): Promise
       await page.close().catch(() => {});
     }
   } catch {
-    // ignore headless PC fallback error
+    signal.throwIfAborted();
   }
-  return null;
+  return priceApiIssue;
 }
 
 async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSignal): Promise<{
@@ -631,6 +662,7 @@ async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSignal): 
   subsidyLabel: string | null;
   subsidyDiscount: number;
 }> {
+  const startedAt = Date.now();
   const session = loadPersistedJdSession();
   const skuId = identity.skuId || identity.id;
   const mobileUrl = `https://item.m.jd.com/product/${skuId}.html`;
@@ -710,16 +742,31 @@ async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSignal): 
     parseCleanNumericPrice(itemInfo.priceFloor?.price);
 
   // 通过服务端无头浏览器采集 PC 详情页的真实「国补领后价 / 到手价」「日常标价」与「国家补贴立减金额」
-  const pcRich = await scrapeJdPcRichDetail(skuId, signal);
+  const pcResult = await scrapeJdPcRichDetail(skuId, signal);
+  const pcRich = typeof pcResult === 'string' ? null : pcResult;
   if (pcRich?.title && title.startsWith('京东商品 #')) title = pcRich.title;
   if (pcRich?.shopName && shopName === '京东自营 / 官方旗舰店') shopName = pcRich.shopName;
   if (pcRich?.spec && spec === '默认规格') spec = pcRich.spec;
 
   const pagePrice = pcRich?.pagePrice || mobilePrice;
   if (!pagePrice || pagePrice <= 0) {
-    throw new BadRequestException(
-      '该京东商品需登录态查看真实价格（当前返回掩码价格），请先在左侧「平台账号与服务端会话」中重新扫码登录京东账号以刷新会话凭证',
-    );
+    const pcIssue = typeof pcResult === 'string' ? pcResult : null;
+    const mobileIssue = jdProductPageIssue(res?.url ?? '') ??
+      (res?.status === 429 ? 'JD_RATE_LIMITED' : res?.status === 403 ? 'JD_PRICE_ACCESS_DENIED' : null);
+    const code = pcIssue === 'JD_RATE_LIMITED' || mobileIssue === 'JD_RATE_LIMITED'
+      ? 'JD_RATE_LIMITED'
+      : pcIssue ?? mobileIssue ?? 'JD_PRICE_UNAVAILABLE';
+    productLogger.warn(JSON.stringify({
+      event: 'jd_product_collection_failed',
+      collectionId: randomUUID(),
+      skuId,
+      code,
+      mobileStatus: res?.status ?? null,
+      mobileIssue,
+      pcIssue,
+      elapsedMs: Date.now() - startedAt,
+    }));
+    throw new BadRequestException({ message: jdCollectionMessages[code], code });
   }
 
   const bannerText = [itemInfo.newBanner?.bannerName, itemInfo.newBanner?.fData?.bannerName, itemInfo.newBanner?.fData?.rightDownText]

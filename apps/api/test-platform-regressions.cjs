@@ -114,6 +114,33 @@ test('Taobao product verification is reported separately from login expiry', asy
   assert.equal(page.close.mock.callCount(), 1);
 });
 
+test('JD frequency controls are reported separately from login', async t => {
+  const limitedResponse = new Response('<html></html>');
+  Object.defineProperty(limitedResponse, 'url', { value: 'https://trade.m.jd.com/common/limit.html' });
+  t.mock.method(globalThis, 'fetch', async () => limitedResponse);
+  const page = {
+    on() {},
+    async route() {},
+    async goto() {},
+    async waitForTimeout() {},
+    url: () => 'https://pc-frequent-pro.pf.jd.com/',
+    evaluate: t.mock.fn(async () => ({})),
+    close: t.mock.fn(async () => {}),
+  };
+  t.mock.method(sessionModule, 'getJdHeadlessContext', async () => ({
+    newPage: async () => page,
+  }));
+
+  await assert.rejects(scrapeAndUpsertProduct('https://item.jd.com/12345678.html'), error => {
+    assert.equal(error.getResponse().code, 'JD_RATE_LIMITED');
+    assert.match(error.message, /访问频率/);
+    assert.doesNotMatch(error.message, /重新扫码/);
+    return true;
+  });
+  assert.equal(page.evaluate.mock.callCount(), 0);
+  assert.equal(page.close.mock.callCount(), 1);
+});
+
 test('product collection shares a SKU job and queues one manual request without opening a second browser page', async t => {
   let markStarted;
   let failBrowser;
@@ -142,7 +169,7 @@ test('product collection shares a SKU job and queues one manual request without 
   failBrowser(new Error('fixture browser stopped'));
   const settled = await results;
   assert.deepEqual(settled.slice(0, 2).map(result => result.reason.status), [400, 400]);
-  assert.notEqual(settled[2].reason?.status, 503);
+  assert.equal(settled[2].reason.getResponse().code, 'JD_PRICE_UNAVAILABLE');
   assert.equal(fetchedJd.mock.callCount(), 1);
   assert.equal(launchJd.mock.callCount(), 1);
 
