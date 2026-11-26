@@ -69,7 +69,20 @@ interface JdQrCodeState {
   qrImage?: string;
   token?: string;
   code?: number;
+  url?: string;
+  title?: string;
+  screenshot?: string;
+  viewport?: { width: number; height: number };
   message: string;
+}
+
+interface RemoteBrowserFrame {
+  state: string;
+  url?: string;
+  title?: string;
+  screenshot?: string;
+  viewport?: { width: number; height: number };
+  message?: string;
 }
 
 interface FeishuConfigState {
@@ -680,6 +693,271 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
   );
 }
 
+function RemoteBrowserViewport({
+  platform,
+  initialFrame,
+  onLoggedIn,
+  onMessage,
+}: {
+  platform: 'jd' | 'taobao';
+  initialFrame: RemoteBrowserFrame | null;
+  onLoggedIn: (session: PlatformSessionInfo) => void;
+  onMessage: (msg: string) => void;
+}) {
+  const [frame, setFrame] = useState<RemoteBrowserFrame | null>(initialFrame);
+  const [loading, setLoading] = useState(false);
+  const [textInput, setTextInput] = useState('');
+  const [dragPoints, setDragPoints] = useState<Array<{ x: number; y: number }>>([]);
+  const isDraggingRef = useRef(false);
+  const actionBusyRef = useRef(false);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+
+  const vw = frame?.viewport?.width || 1280;
+  const vh = frame?.viewport?.height || 800;
+
+  useEffect(() => {
+    if (initialFrame?.screenshot) {
+      setFrame(initialFrame);
+    }
+  }, [initialFrame]);
+
+  async function initRemote(resetToLogin = false) {
+    setLoading(true);
+    actionBusyRef.current = true;
+    try {
+      const res = await fetch(`/api/sessions/${platform}/remote/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keepCurrent: !resetToLogin }),
+      });
+      const data = (await res.json()) as RemoteBrowserFrame & PlatformSessionInfo;
+      if (data.state === 'logged_in') {
+        onLoggedIn(data);
+        return;
+      }
+      setFrame(data);
+      if (data.message) onMessage(data.message);
+    } catch {
+      onMessage('无法连接云端实时浏览器画面');
+    } finally {
+      setLoading(false);
+      actionBusyRef.current = false;
+    }
+  }
+
+  useEffect(() => {
+    if (!frame?.screenshot) {
+      void initRemote(false);
+    }
+    const timer = window.setInterval(async () => {
+      if (isDraggingRef.current || actionBusyRef.current) return;
+      try {
+        const res = await fetch(`/api/sessions/${platform}/remote/frame`);
+        if (!res.ok) return;
+        const data = (await res.json()) as RemoteBrowserFrame & PlatformSessionInfo;
+        if (data.state === 'logged_in') {
+          onLoggedIn(data);
+          return;
+        }
+        if (data.screenshot) {
+          setFrame(data);
+        }
+      } catch {
+        // ignore transient frame error
+      }
+    }, 1350);
+    return () => window.clearInterval(timer);
+  }, [platform]);
+
+  async function sendRemoteAction(payload: Record<string, unknown>) {
+    actionBusyRef.current = true;
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/sessions/${platform}/remote/action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = (await res.json()) as RemoteBrowserFrame & PlatformSessionInfo;
+      if (data.state === 'logged_in') {
+        onLoggedIn(data);
+        return;
+      }
+      if (data.screenshot) {
+        setFrame(data);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+      actionBusyRef.current = false;
+    }
+  }
+
+  function clientToVirtual(clientX: number, clientY: number): { x: number; y: number } {
+    const el = imgRef.current;
+    if (!el) return { x: 0, y: 0 };
+    const rect = el.getBoundingClientRect();
+    const rx = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+    const ry = Math.max(0, Math.min(1, (clientY - rect.top) / Math.max(1, rect.height)));
+    return {
+      x: Math.round(rx * vw),
+      y: Math.round(ry * vh),
+    };
+  }
+
+  function handlePointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (!frame?.screenshot || loading) return;
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    const pt = clientToVirtual(e.clientX, e.clientY);
+    isDraggingRef.current = true;
+    setDragPoints([pt]);
+  }
+
+  function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (!isDraggingRef.current) return;
+    const pt = clientToVirtual(e.clientX, e.clientY);
+    setDragPoints(prev => {
+      if (prev.length === 0) return [pt];
+      const last = prev[prev.length - 1];
+      const dist = Math.hypot(pt.x - last.x, pt.y - last.y);
+      if (dist < 10) return prev;
+      return [...prev.slice(-28), pt];
+    });
+  }
+
+  function handlePointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    if (!isDraggingRef.current) return;
+    isDraggingRef.current = false;
+    const endPt = clientToVirtual(e.clientX, e.clientY);
+    const pts = [...dragPoints, endPt];
+    setDragPoints([]);
+
+    const startPt = pts[0] || endPt;
+    const totalDist = Math.hypot(endPt.x - startPt.x, endPt.y - startPt.y);
+    if (totalDist < 10) {
+      void sendRemoteAction({ type: 'click', x: endPt.x, y: endPt.y });
+    } else {
+      void sendRemoteAction({
+        type: 'drag',
+        fromX: startPt.x,
+        fromY: startPt.y,
+        toX: endPt.x,
+        toY: endPt.y,
+        path: pts,
+      });
+    }
+  }
+
+  function handleSendText(e: React.FormEvent) {
+    e.preventDefault();
+    if (!textInput) return;
+    const val = textInput;
+    setTextInput('');
+    void sendRemoteAction({ type: 'type', text: val });
+  }
+
+  return (
+    <div className="remote-browser-box">
+      <div className="remote-browser-toolbar">
+        <div className="remote-url-pill" title={frame?.url || ''}>
+          <span className="remote-live-dot" />
+          <span className="sf-mono">{frame?.url || '正在连接云端浏览器画面…'}</span>
+        </div>
+        <div className="remote-tool-btns">
+          <button
+            type="button"
+            className="apple-btn-secondary sm"
+            disabled={loading}
+            onClick={() => void sendRemoteAction({ type: 'scroll', deltaY: -260 })}
+          >
+            上滚
+          </button>
+          <button
+            type="button"
+            className="apple-btn-secondary sm"
+            disabled={loading}
+            onClick={() => void sendRemoteAction({ type: 'scroll', deltaY: 260 })}
+          >
+            下滚
+          </button>
+          <button
+            type="button"
+            className="apple-btn-secondary sm"
+            disabled={loading}
+            onClick={() => void sendRemoteAction({ type: 'reload' })}
+          >
+            刷新网页
+          </button>
+          <button
+            type="button"
+            className="apple-btn-secondary sm"
+            disabled={loading}
+            onClick={() => void initRemote(true)}
+          >
+            重置回登录页
+          </button>
+        </div>
+      </div>
+
+      <form className="remote-input-bar" onSubmit={handleSendText}>
+        <input
+          type="text"
+          value={textInput}
+          onChange={e => setTextInput(e.target.value)}
+          placeholder="先在下方画面中点击输入框使其获得焦点，再在此输入手机号 / 短信验证码 / 文字并点击「填入」..."
+        />
+        <button type="submit" className="apple-btn-primary sm" disabled={loading || !textInput}>
+          填入文字
+        </button>
+        <button
+          type="button"
+          className="apple-btn-secondary sm"
+          disabled={loading}
+          onClick={() => void sendRemoteAction({ type: 'key', key: 'Backspace' })}
+        >
+          退格
+        </button>
+        <button
+          type="button"
+          className="apple-btn-secondary sm"
+          disabled={loading}
+          onClick={() => void sendRemoteAction({ type: 'key', key: 'Enter' })}
+        >
+          回车
+        </button>
+      </form>
+
+      <div className="remote-tip-row">
+        <span>
+          操作说明：直接在下方画面中<strong>点击按钮/点选验证码</strong>，或<strong>按住鼠标左键拖动滑块</strong>即可过人机验证；验证/登录完成后系统将自动识别并保存完整 Cookie。
+        </span>
+        {loading && <span className="remote-sync-tag">正在同步云端操作…</span>}
+      </div>
+
+      <div
+        className="remote-stage-wrap"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+      >
+        {frame?.screenshot ? (
+          <img
+            ref={imgRef}
+            src={frame.screenshot}
+            alt="云端实时浏览器验证画面"
+            className="remote-stage-img"
+            draggable={false}
+          />
+        ) : (
+          <div className="remote-stage-empty">正在加载服务端 Chromium 实时画面…</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [activePage, setActivePage] = useState<NavPage>('home');
   const [status, setStatus] = useState('连接中');
@@ -698,18 +976,20 @@ function App() {
   const [jdBusy, setJdBusy] = useState(false);
   const [jdSession, setJdSession] = useState<PlatformSessionInfo | null>(null);
   const [jdQr, setJdQr] = useState<JdQrCodeState | null>(null);
-  const [authTab, setAuthTab] = useState<'qrcode' | 'sms'>('qrcode');
+  const [jdRemoteFrame, setJdRemoteFrame] = useState<RemoteBrowserFrame | null>(null);
+  const [authTab, setAuthTab] = useState<'qrcode' | 'sms' | 'remote'>('qrcode');
   const [showJdAuthPanel, setShowJdAuthPanel] = useState(false);
   const [mobileInput, setMobileInput] = useState('');
   const [smsCodeInput, setSmsCodeInput] = useState('');
   const [smsCountdown, setSmsCountdown] = useState(0);
 
-  // 第二排：淘宝登录态（与京东完全一致的网页内扫码 + 手机号短信验证码双登录）
+  // 第二排：淘宝登录态（与京东完全一致的网页内扫码 + 手机号短信验证码 + 云端实时人机验证）
   const [tbMessage, setTbMessage] = useState('淘宝登录态持久保存在服务端，刷新网页或重启服务不会丢失。');
   const [tbBusy, setTbBusy] = useState(false);
   const [tbSession, setTbSession] = useState<PlatformSessionInfo | null>(null);
   const [tbQr, setTbQr] = useState<JdQrCodeState | null>(null);
-  const [tbAuthTab, setTbAuthTab] = useState<'qrcode' | 'sms'>('qrcode');
+  const [tbRemoteFrame, setTbRemoteFrame] = useState<RemoteBrowserFrame | null>(null);
+  const [tbAuthTab, setTbAuthTab] = useState<'qrcode' | 'sms' | 'remote'>('qrcode');
   const [showTbAuthPanel, setShowTbAuthPanel] = useState(false);
   const [tbMobileInput, setTbMobileInput] = useState('');
   const [tbSmsCodeInput, setTbSmsCodeInput] = useState('');
@@ -871,6 +1151,14 @@ function App() {
           setJdMessage(data.message);
           return;
         }
+        if (data.state === 'verify_required') {
+          setJdQr(null);
+          setJdRemoteFrame(data);
+          setAuthTab('remote');
+          setShowJdAuthPanel(true);
+          setJdMessage(data.message);
+          return;
+        }
         setJdQr(prev =>
           prev
             ? {
@@ -1028,8 +1316,14 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mobile: mobileInput.trim() }),
       });
-      const data = (await res.json()) as { message?: string; countdown?: number };
+      const data = (await res.json()) as RemoteBrowserFrame & { message?: string; countdown?: number };
       if (!res.ok) throw new Error(data.message || '发送验证码失败');
+      if (data.state === 'verify_required') {
+        setJdRemoteFrame(data);
+        setAuthTab('remote');
+        setJdMessage(data.message || '请在下方云端实时画面中完成人机验证');
+        return;
+      }
       setSmsCountdown(data.countdown || 60);
       setJdMessage(data.message || '短信验证码已发送');
     } catch (err) {
@@ -1051,13 +1345,16 @@ function App() {
           code: smsCodeInput.trim(),
         }),
       });
-      const data = (await res.json()) as PlatformSessionInfo;
+      const data = (await res.json()) as PlatformSessionInfo & RemoteBrowserFrame;
       if (!res.ok) throw new Error(data.message || '短信验证码登录失败');
       if (data.state === 'logged_in') {
         setJdSession(data);
         setJdQr(null);
         setShowJdAuthPanel(false);
         setSmsCodeInput('');
+      } else if (data.state === 'verify_required') {
+        setJdRemoteFrame(data);
+        setAuthTab('remote');
       }
       setJdMessage(data.message);
     } catch (err) {
@@ -1145,8 +1442,14 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mobile: tbMobileInput.trim() }),
       });
-      const data = (await res.json()) as { message?: string; countdown?: number };
+      const data = (await res.json()) as RemoteBrowserFrame & { message?: string; countdown?: number };
       if (!res.ok) throw new Error(data.message || '发送验证码失败');
+      if (data.state === 'verify_required') {
+        setTbRemoteFrame(data);
+        setTbAuthTab('remote');
+        setTbMessage(data.message || '请在下方云端实时画面中拖动滑块完成验证');
+        return;
+      }
       setTbSmsCountdown(data.countdown || 60);
       setTbMessage(data.message || '淘宝短信验证码已发送');
     } catch (err) {
@@ -1168,13 +1471,16 @@ function App() {
           code: tbSmsCodeInput.trim(),
         }),
       });
-      const data = (await res.json()) as PlatformSessionInfo;
+      const data = (await res.json()) as PlatformSessionInfo & RemoteBrowserFrame;
       if (!res.ok) throw new Error(data.message || '淘宝短信验证码登录失败');
       if (data.state === 'logged_in') {
         setTbSession(data);
         setTbQr(null);
         setShowTbAuthPanel(false);
         setTbSmsCodeInput('');
+      } else if (data.state === 'verify_required') {
+        setTbRemoteFrame(data);
+        setTbAuthTab('remote');
       }
       setTbMessage(data.message);
     } catch (err) {
@@ -1726,6 +2032,13 @@ function App() {
                       >
                         手机号短信验证码登录
                       </button>
+                      <button
+                        type="button"
+                        className={authTab === 'remote' ? 'active' : ''}
+                        onClick={() => setAuthTab('remote')}
+                      >
+                        云端实时画面（过人机验证 / 可视化登录）
+                      </button>
                     </div>
 
                     {authTab === 'qrcode' ? (
@@ -1761,7 +2074,7 @@ function App() {
                             <div className="qr-copy">
                               <strong>使用京东 App 扫码登录</strong>
                               <p>{jdQr.message}</p>
-                              <span>手机确认后二维码将立即自动关闭，登录态持久保存于服务端。</span>
+                              <span>手机确认后二维码将立即自动关闭；若触发异地人机验证将自动切至云端实时画面。</span>
                               <div className="button-group">
                                 <button
                                   type="button"
@@ -1771,12 +2084,20 @@ function App() {
                                 >
                                   刷新二维码
                                 </button>
+                                <button
+                                  type="button"
+                                  className="apple-btn-secondary sm"
+                                  disabled={jdBusy}
+                                  onClick={() => setAuthTab('remote')}
+                                >
+                                  打开云端实时画面
+                                </button>
                               </div>
                             </div>
                           </div>
                         )}
                       </div>
-                    ) : (
+                    ) : authTab === 'sms' ? (
                       <form className="apple-sms-form" onSubmit={submitJdSmsLogin}>
                         <div className="sms-grid-row">
                           <div className="apple-field">
@@ -1821,6 +2142,18 @@ function App() {
                           </div>
                         </div>
                       </form>
+                    ) : (
+                      <RemoteBrowserViewport
+                        platform="jd"
+                        initialFrame={jdRemoteFrame}
+                        onMessage={msg => setJdMessage(msg)}
+                        onLoggedIn={session => {
+                          setJdSession(session);
+                          setJdQr(null);
+                          setShowJdAuthPanel(false);
+                          setJdMessage(session.message);
+                        }}
+                      />
                     )}
                   </div>
                 )}
@@ -1933,6 +2266,13 @@ function App() {
                       >
                         手机号短信验证码登录
                       </button>
+                      <button
+                        type="button"
+                        className={tbAuthTab === 'remote' ? 'active' : ''}
+                        onClick={() => setTbAuthTab('remote')}
+                      >
+                        云端实时画面（过人机验证 / 可视化登录）
+                      </button>
                     </div>
 
                     {tbAuthTab === 'qrcode' ? (
@@ -1978,12 +2318,20 @@ function App() {
                                 >
                                   刷新二维码
                                 </button>
+                                <button
+                                  type="button"
+                                  className="apple-btn-secondary sm"
+                                  disabled={tbBusy}
+                                  onClick={() => setTbAuthTab('remote')}
+                                >
+                                  打开云端实时画面
+                                </button>
                               </div>
                             </div>
                           </div>
                         )}
                       </div>
-                    ) : (
+                    ) : tbAuthTab === 'sms' ? (
                       <form className="apple-sms-form" onSubmit={submitTaobaoSmsLogin}>
                         <div className="sms-grid-row">
                           <div className="apple-field">
@@ -2028,6 +2376,18 @@ function App() {
                           </div>
                         </div>
                       </form>
+                    ) : (
+                      <RemoteBrowserViewport
+                        platform="taobao"
+                        initialFrame={tbRemoteFrame}
+                        onMessage={msg => setTbMessage(msg)}
+                        onLoggedIn={session => {
+                          setTbSession(session);
+                          setTbQr(null);
+                          setShowTbAuthPanel(false);
+                          setTbMessage(session.message);
+                        }}
+                      />
                     )}
                   </div>
                 )}

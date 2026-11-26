@@ -191,6 +191,7 @@ function evaluateCouponsAndSubsidy(params: {
   observedSubsidyDiscount?: number;
   observedSubsidyLabel?: string | null;
   observedCoupons?: string[];
+  hasExplicitSubsidyPrice?: boolean;
 }): {
   coupons: string[];
   couponDiscount: number;
@@ -202,8 +203,6 @@ function evaluateCouponsAndSubsidy(params: {
   finalPrice: number;
 } {
   const {
-    title,
-    cat1,
     pagePrice,
     htmlText,
     observedFinalPrice = 0,
@@ -211,13 +210,19 @@ function evaluateCouponsAndSubsidy(params: {
     observedSubsidyDiscount = 0,
     observedSubsidyLabel = null,
     observedCoupons = [],
+    hasExplicitSubsidyPrice = false,
   } = params;
 
   const coupons: string[] = [...observedCoupons];
   let couponDiscount = 0;
 
-  // 1. 仅提取页面真实存在的满减 / 立减优惠券（绝不凭空伪造优惠券）
-  const fullCutMatches = [...htmlText.matchAll(/满\s*(\d{1,5})\s*(?:元)?\s*减\s*(\d{1,4}(?:\.\d{1,2})?)/g)];
+  // 1. 仅从商品优惠券/促销摘要文本中提取真实的单品满减券（过滤白条/分期/以旧换新/多件促销）
+  const sanitizedPromoText = htmlText
+    .replace(/[^\n。；;]*(?:白条|分期|以旧换新|换新补贴|银行卡|支付立减|满\s*[2-9]\s*件)[^\n。；;]*/g, ' ');
+
+  const fullCutMatches = [
+    ...sanitizedPromoText.matchAll(/满\s*(\d{1,5})\s*(?:元)?\s*减\s*(\d{1,4}(?:\.\d{1,2})?)/g),
+  ];
   for (const m of fullCutMatches) {
     const threshold = Number(m[1]);
     const discount = Number(m[2]);
@@ -229,7 +234,7 @@ function evaluateCouponsAndSubsidy(params: {
   }
 
   const directCutMatches = [
-    ...htmlText.matchAll(/(?:官方立减|立减|领券减|券后减)\s*¥?\s*(\d{1,4}(?:\.\d{1,2})?)\s*元?/g),
+    ...sanitizedPromoText.matchAll(/(?:官方立减|单品立减|领券减|券后减)\s*[¥￥]?\s*(\d{1,4}(?:\.\d{1,2})?)\s*元?/g),
   ];
   for (const m of directCutMatches) {
     const discount = Number(m[1]);
@@ -240,13 +245,13 @@ function evaluateCouponsAndSubsidy(params: {
     }
   }
 
-  // 2. 国家补贴（国补）识别：优先使用页面真实采集到的「领后减 ¥126.6」等精确国补金额
+  // 2. 国家补贴（国补）识别：严格以页面真实展示的「国补领后价」或「国家补贴 | 领后减 ¥xxx」为准，绝不按类目硬扣 15%/20%
   let explicitSubsidyAmount = observedSubsidyDiscount;
   if (explicitSubsidyAmount <= 0) {
     const subMatch =
-      htmlText.match(/国家补贴[^¥\d]{0,24}(?:领后减|立减|减|补贴|省)\s*¥?\s*(\d+(?:\.\d{1,2})?)/) ||
-      htmlText.match(/政府补贴[^¥\d]{0,24}(?:领后减|立减|减|补贴|省)\s*¥?\s*(\d+(?:\.\d{1,2})?)/) ||
-      htmlText.match(/国补[^¥\d]{0,16}(?:领后减|立减|减|省)\s*¥?\s*(\d+(?:\.\d{1,2})?)/);
+      sanitizedPromoText.match(/国家补贴[^¥￥\d]{0,20}(?:领后减|立减|补贴)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/) ||
+      sanitizedPromoText.match(/政府补贴[^¥￥\d]{0,20}(?:领后减|立减|补贴)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/) ||
+      sanitizedPromoText.match(/国补[^¥￥\d]{0,12}(?:领后减|立减)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/);
     if (subMatch?.[1]) {
       const parsedSub = Number(subMatch[1]);
       if (Number.isFinite(parsedSub) && parsedSub > 0 && parsedSub < pagePrice) {
@@ -255,20 +260,7 @@ function evaluateCouponsAndSubsidy(params: {
     }
   }
 
-  const is3CDigital =
-    cat1 === '9987' ||
-    cat1 === '652' ||
-    /手机|iQOO|iPhone|华为|小米|OPPO|vivo|荣耀|一加|红米|Redmi|平板|iPad|手表|手环|耳机|AirPods|Buds/i.test(title);
-  const isApplianceOrPc =
-    cat1 === '737' ||
-    cat1 === '670' ||
-    /空调|冰箱|洗衣机|电视|笔记本|MacBook|电脑|热水器|洗碗机|净水器|扫地机/i.test(title);
-  const hasExplicitSubsidyText =
-    explicitSubsidyAmount > 0 ||
-    /国家补贴|政府补贴|国补领后价|国补价|以旧换新补贴|登录最高省15%|享国家补贴/.test(htmlText) ||
-    /国补|国家补贴|政府补贴/.test(title);
-
-  // 如果页面直接采集到了精确的「国补领后价 / 到手价」(如 ¥717.4) 与「国家补贴立减金额」(如 ¥126.6)
+  // 情况 A：页面明确采集到了真实国补价/到手价 + 国补立减金额（例如：日常价 ¥904，京东价 ¥844，国补减 ¥126.6，国补领后价 ¥717.4）
   if (observedFinalPrice > 0 && explicitSubsidyAmount > 0) {
     const preSubsidyPrice = Number((observedFinalPrice + explicitSubsidyAmount).toFixed(2));
     if (pagePrice > preSubsidyPrice + 0.05) {
@@ -276,10 +268,11 @@ function evaluateCouponsAndSubsidy(params: {
       if (coupons.length === 0) {
         coupons.push(`促销立减 ¥${couponDiscount}`);
       }
+    } else {
+      couponDiscount = 0;
     }
     const couponPrice = couponDiscount > 0 ? preSubsidyPrice : null;
-    const subsidyLabel =
-      observedSubsidyLabel || `国家补贴 | 领后减 ¥${explicitSubsidyAmount}`;
+    const subsidyLabel = observedSubsidyLabel || `国家补贴 | 领后减 ¥${explicitSubsidyAmount}`;
     return {
       coupons,
       couponDiscount,
@@ -292,63 +285,78 @@ function evaluateCouponsAndSubsidy(params: {
     };
   }
 
-  // 如果页面采集到了券后价/到手价（无国补或国补基于券后价计算）
+  // 情况 B：页面明确展示了「国补领后价 / 政府补贴价」(hasExplicitSubsidyPrice)，但未单独列出领后减数字
+  if (hasExplicitSubsidyPrice && observedFinalPrice > 0 && observedFinalPrice < pagePrice) {
+    const baseBeforeSub = observedCouponPrice > observedFinalPrice && observedCouponPrice <= pagePrice
+      ? observedCouponPrice
+      : pagePrice;
+    const subDiscount = Number((baseBeforeSub - observedFinalPrice).toFixed(2));
+    const cDiscount = baseBeforeSub < pagePrice ? Number((pagePrice - baseBeforeSub).toFixed(2)) : 0;
+    if (cDiscount > 0 && coupons.length === 0) {
+      coupons.push(`促销立减 ¥${cDiscount}`);
+    }
+    return {
+      coupons,
+      couponDiscount: cDiscount,
+      couponPrice: cDiscount > 0 ? baseBeforeSub : null,
+      hasSubsidy: true,
+      subsidyLabel: observedSubsidyLabel || `国家补贴 | 领后减 ¥${subDiscount}`,
+      subsidyDiscount: subDiscount,
+      subsidyPrice: Number(observedFinalPrice.toFixed(2)),
+      finalPrice: Number(observedFinalPrice.toFixed(2)),
+    };
+  }
+
+  // 情况 C：页面直接展示了「到手价 / 预估到手价 / 券后价」(observedFinalPrice < pagePrice，且非国补)
+  // 此时页面上的 observedFinalPrice 已经扣除了该商品的可用券与促销，绝不能二次重复扣减
+  if (observedFinalPrice > 0 && observedFinalPrice < pagePrice) {
+    couponDiscount = Number((pagePrice - observedFinalPrice).toFixed(2));
+    if (coupons.length === 0) {
+      coupons.push(`到手优惠立减 ¥${couponDiscount}`);
+    }
+    return {
+      coupons,
+      couponDiscount,
+      couponPrice: Number(observedFinalPrice.toFixed(2)),
+      hasSubsidy: false,
+      subsidyLabel: null,
+      subsidyDiscount: 0,
+      subsidyPrice: null,
+      finalPrice: Number(observedFinalPrice.toFixed(2)),
+    };
+  }
+
+  // 情况 D：页面采集到了 observedCouponPrice < pagePrice
   if (observedCouponPrice > 0 && observedCouponPrice < pagePrice) {
     couponDiscount = Number((pagePrice - observedCouponPrice).toFixed(2));
     if (coupons.length === 0) {
-      coupons.push(`专享优惠立减 ¥${couponDiscount}`);
+      coupons.push(`领券立减 ¥${couponDiscount}`);
     }
-  } else if (observedFinalPrice > 0 && observedFinalPrice < pagePrice && !hasExplicitSubsidyText) {
-    couponDiscount = Number((pagePrice - observedFinalPrice).toFixed(2));
-    if (coupons.length === 0) {
-      coupons.push(`促销立减 ¥${couponDiscount}`);
-    }
+    return {
+      coupons,
+      couponDiscount,
+      couponPrice: Number(observedCouponPrice.toFixed(2)),
+      hasSubsidy: false,
+      subsidyLabel: null,
+      subsidyDiscount: 0,
+      subsidyPrice: null,
+      finalPrice: Number(observedCouponPrice.toFixed(2)),
+    };
   }
 
-  const afterCoupon = Math.max(0.01, Number((pagePrice - couponDiscount).toFixed(2)));
+  // 情况 E：页面未直接展示折后到手价（仅展示日常京东价/淘宝价），若页面单品券列表存在满足门槛的满减券则折算券后价，否则到手价严格等于页面售价
+  const afterCoupon = couponDiscount > 0 ? Math.max(0.01, Number((pagePrice - couponDiscount).toFixed(2))) : pagePrice;
   const couponPrice = couponDiscount > 0 ? afterCoupon : null;
-
-  let hasSubsidy = false;
-  let subsidyLabel: string | null = null;
-  let subsidyDiscount = 0;
-
-  if (explicitSubsidyAmount > 0) {
-    hasSubsidy = true;
-    subsidyDiscount = explicitSubsidyAmount;
-    subsidyLabel = observedSubsidyLabel || `国家补贴 | 领后减 ¥${subsidyDiscount}`;
-  } else if (hasExplicitSubsidyText || is3CDigital) {
-    hasSubsidy = true;
-    const base = observedFinalPrice > 0 && observedFinalPrice < afterCoupon ? observedFinalPrice : afterCoupon;
-    if (observedFinalPrice > 0 && observedFinalPrice < afterCoupon) {
-      subsidyDiscount = Number((afterCoupon - observedFinalPrice).toFixed(2));
-      subsidyLabel = observedSubsidyLabel || `国家补贴 | 领后减 ¥${subsidyDiscount}`;
-    } else {
-      // 数码 3C 国补 15%，单件最高补贴 500 元（保留精确小数，不做整数四舍五入截断）
-      subsidyDiscount = Number(Math.min(500, base * 0.15).toFixed(2));
-      subsidyLabel = `国家补贴 15%（立减 ¥${subsidyDiscount}，最高补 ¥500）`;
-    }
-  } else if (isApplianceOrPc) {
-    hasSubsidy = true;
-    const base = afterCoupon;
-    subsidyDiscount = Number(Math.min(2000, base * 0.2).toFixed(2));
-    subsidyLabel = `国家补贴 20%（立减 ¥${subsidyDiscount}，最高补 ¥2000）`;
-  }
-
-  const computedFinal = Math.max(0.01, Number((afterCoupon - subsidyDiscount).toFixed(2)));
-  const finalPrice =
-    observedFinalPrice > 0 && Math.abs(observedFinalPrice - computedFinal) < 1
-      ? Number(observedFinalPrice.toFixed(2))
-      : computedFinal;
-  const subsidyPrice = hasSubsidy ? finalPrice : null;
+  const finalPrice = Number((observedFinalPrice > 0 && couponDiscount === 0 ? observedFinalPrice : afterCoupon).toFixed(2));
 
   return {
     coupons,
     couponDiscount,
     couponPrice,
-    hasSubsidy,
-    subsidyLabel,
-    subsidyDiscount,
-    subsidyPrice,
+    hasSubsidy: false,
+    subsidyLabel: null,
+    subsidyDiscount: 0,
+    subsidyPrice: null,
     finalPrice,
   };
 }
@@ -359,6 +367,7 @@ interface JdPcRichDetail {
   couponPrice: number;
   subsidyDiscount: number;
   subsidyLabel: string | null;
+  hasExplicitSubsidyPrice: boolean;
   coupons: string[];
   title?: string;
   shopName?: string;
@@ -395,54 +404,67 @@ async function scrapeJdPcRichDetail(skuId: string): Promise<JdPcRichDetail | nul
         timeout: 18000,
       });
 
-      for (let i = 0; i < 12; i++) {
+      for (let i = 0; i < 14; i++) {
         await page.waitForTimeout(250);
-        if (wareBusinessRaw) break;
         const hasDomPrice = await page
           .evaluate((id: string) => {
             const txt =
-              (document.querySelector(`.J-p-${id}`) ||
-                document.querySelector('.p-price') ||
-                document.querySelector('.summary-price-wrap'))?.textContent || '';
+              (document.querySelector('.summary-price-wrap') ||
+                document.querySelector(`.J-p-${id}`) ||
+                document.querySelector('.p-price'))?.textContent || '';
             return /\d+(?:\.\d{1,2})?/.test(txt);
           }, skuId)
           .catch(() => false);
-        if (hasDomPrice && i >= 4) break;
+        if (hasDomPrice && (wareBusinessRaw || i >= 5)) break;
       }
 
       const domExtracted = await page.evaluate((id: string) => {
-        const summaryEl =
-          (document.querySelector('.itemInfo-wrap') as HTMLElement | null) ||
+        const clean = (s?: string | null) => (s || '').replace(/\s+/g, ' ').trim();
+        const priceWrapEl =
           (document.querySelector('.summary-price-wrap') as HTMLElement | null) ||
-          document.body;
-        const summaryText = (summaryEl?.innerText || '').replace(/\s+/g, ' ').trim();
-        const jpText = document.querySelector(`.J-p-${id}`)?.textContent?.trim() || '';
-        const pPriceText = document.querySelector('.p-price')?.textContent?.trim() || '';
-        const pageOriginPriceText =
-          document.querySelector('#page_origin_price, .p-price-origin, del')?.textContent?.trim() || '';
-        const skuName = document.querySelector('.sku-name')?.textContent?.trim() || '';
-        const shopName =
-          document.querySelector('.J-hove-wrap .name a, .shopName, .popbox-inner .mt h3 a')?.textContent?.trim() || '';
-        const selectedColor =
-          document.querySelector('#choose-attr-1 .item.selected, .choose-attrs .item.selected')?.textContent?.trim() ||
-          '';
+          (document.querySelector('.itemInfo-wrap') as HTMLElement | null);
+        const priceAreaText = clean(priceWrapEl?.innerText).slice(0, 2500);
+        const quanAreaText = clean(
+          (document.querySelector('#summary-quan, .quan-item, .J-prom-quan') as HTMLElement | null)?.innerText,
+        ).slice(0, 1200);
+        const jpText = clean(document.querySelector(`.J-p-${id}`)?.textContent);
+        const pPriceText = clean(document.querySelector('.p-price')?.textContent);
+        const pageOriginPriceText = clean(
+          document.querySelector('#page_origin_price, .p-price-origin, .summary-price-wrap del')?.textContent,
+        );
+        const handPriceElText = clean(
+          document.querySelector(
+            '.J-final-price, .final-price, [class*="handPrice"], [class*="finalPrice"], [class*="govPrice"], .p-price-hand',
+          )?.textContent,
+        );
+        const skuName = clean(document.querySelector('.sku-name')?.textContent);
+        const shopName = clean(
+          document.querySelector('.J-hove-wrap .name a, .shopName, .popbox-inner .mt h3 a')?.textContent,
+        );
+        const selectedColor = clean(
+          document.querySelector('#choose-attr-1 .item.selected, .choose-attrs .item.selected')?.textContent,
+        );
 
         return {
-          summaryText: summaryText.slice(0, 4000),
+          priceAreaText,
+          quanAreaText,
           jpText,
           pPriceText,
           pageOriginPriceText,
+          handPriceElText,
           skuName,
           shopName,
           selectedColor,
         };
       }, skuId);
 
-      let pagePrice = 0;
-      let finalPrice = 0;
+      let jdSellingPrice = 0; // 京东日常售价 (price.p / .J-p-sku)
+      let originPrice = 0; // 划线原价 / 日常标价 (price.op / #page_origin_price)
+      let explicitFinalPrice = 0; // 页面明确显示的「到手价 / 预估到手价 / 国补领后价 / 券后价」
       let couponPrice = 0;
       let subsidyDiscount = 0;
       let subsidyLabel: string | null = null;
+      let hasExplicitSubsidyPrice = false;
       const coupons: string[] = [];
 
       // 1. 解析 pc_detailpage_wareBusiness JSON
@@ -453,84 +475,145 @@ async function scrapeJdPcRichDetail(skuId: string): Promise<JdPcRichDetail | nul
           const pVal = parseCleanNumericPrice(priceObj.p as string);
           const opVal = parseCleanNumericPrice(priceObj.op as string);
           const mVal = parseCleanNumericPrice(priceObj.m as string);
+          const tkpVal = parseCleanNumericPrice(priceObj.tkp as string);
+          const upVal = parseCleanNumericPrice(priceObj.up as string);
 
-          if (opVal > 0) pagePrice = opVal;
-          else if (pVal > 0) pagePrice = pVal;
+          if (pVal > 0) jdSellingPrice = pVal;
+          if (opVal > 0) originPrice = opVal;
+          else if (mVal > 0 && pVal > 0 && mVal < pVal * 1.8) originPrice = mVal;
 
-          if (pVal > 0) finalPrice = pVal;
+          if (tkpVal > 0 && (!pVal || tkpVal <= pVal)) explicitFinalPrice = tkpVal;
+          else if (upVal > 0 && (!pVal || upVal <= pVal)) explicitFinalPrice = upVal;
+
+          // 提取 wareBusiness 中真实的单品优惠券 (couponInfo)
+          const couponList = Array.isArray(wb.couponInfo) ? (wb.couponInfo as Array<Record<string, unknown>>) : [];
+          for (const c of couponList) {
+            const quota = Number(c.quota || c.consume || 0);
+            const discount = Number(c.discount || c.parValue || 0);
+            const label = String(c.KEY || c.label || c.title || '');
+            if (/白条|分期|金融|支付/.test(label)) continue;
+            if (quota > 0 && discount > 0 && discount < quota) {
+              const tag = `满${quota}减${discount}`;
+              if (!coupons.includes(tag)) coupons.push(tag);
+            }
+          }
 
           const wbStr = wareBusinessRaw;
           const subCutMatch =
-            wbStr.match(/领后减\s*¥?\s*(\d+(?:\.\d{1,2})?)/) ||
-            wbStr.match(/国家补贴[^"}\d]{0,20}(?:减|省|立减)\s*¥?\s*(\d+(?:\.\d{1,2})?)/);
+            wbStr.match(/领后减\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/) ||
+            wbStr.match(/国家补贴[^"}\d]{0,20}(?:领后减|立减)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/);
           if (subCutMatch?.[1]) {
             subsidyDiscount = Number(Number(subCutMatch[1]).toFixed(2));
             subsidyLabel = `国家补贴 | 领后减 ¥${subsidyDiscount}`;
+            hasExplicitSubsidyPrice = true;
           }
 
           const govPriceMatch =
-            wbStr.match(/"(?:govPrice|subsidyPrice|finalPrice|handPrice)"\s*:\s*"?(\d+(?:\.\d{1,2})?)"?/) ||
-            wbStr.match(/¥?\s*(\d+(?:\.\d{1,2})?)\s*国补领后价/);
+            wbStr.match(/"(?:govPrice|subsidyPrice)"\s*:\s*"?(\d+(?:\.\d{1,2})?)"?/) ||
+            wbStr.match(/[¥￥]?\s*(\d+(?:\.\d{1,2})?)\s*(?:国补领后价|政府补贴价|补贴领后价)/);
           if (govPriceMatch?.[1]) {
             const gp = parseCleanNumericPrice(govPriceMatch[1]);
-            if (gp > 0) finalPrice = gp;
+            if (gp > 0) {
+              explicitFinalPrice = gp;
+              hasExplicitSubsidyPrice = true;
+            }
           }
 
-          if (pagePrice <= finalPrice && mVal > finalPrice && mVal < finalPrice * 2) {
-            pagePrice = mVal;
+          const handPriceMatch =
+            wbStr.match(/"(?:finalPrice|handPrice|toHandPrice)"\s*:\s*"?(\d+(?:\.\d{1,2})?)"?/) ||
+            wbStr.match(/[¥￥]?\s*(\d+(?:\.\d{1,2})?)\s*(?:到手价|预估到手价|券后价)/) ||
+            wbStr.match(/(?:到手价|预估到手价|券后价)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/);
+          if (!explicitFinalPrice && handPriceMatch?.[1]) {
+            const hp = parseCleanNumericPrice(handPriceMatch[1]);
+            if (hp > 0) explicitFinalPrice = hp;
           }
         } catch {
           // ignore JSON parse failure
         }
       }
 
-      // 2. 解析页面 DOM 渲染文本（例如："¥717.4 国补领后价 ¥904 已享受：国家补贴 | 领后减¥126.6"）
-      const text = `${domExtracted.summaryText} ${ wareBusinessRaw ? '' : '' }`;
-      const govRowMatch = text.match(
-        /¥?\s*(\d+(?:\.\d{1,2})?)\s*(?:国补领后价|国补价|补贴领后价|政府补贴价)\s*(?:¥\s*(\d+(?:\.\d{1,2})?))?/,
+      // 2. 解析页面价格区 DOM 渲染文本（同时兼容「¥717.4 国补领后价 ¥904」「¥699 到手价 ¥799」与「到手价 ¥699」两种语序）
+      const text = domExtracted.priceAreaText;
+
+      // 2a. 国补领后价（数字在前 或 标签在前）
+      const govBeforeMatch = text.match(
+        /[¥￥]?\s*(\d+(?:\.\d{1,2})?)\s*(?:国补领后价|国补价|补贴领后价|政府补贴价)(?:\s*[¥￥]\s*(\d+(?:\.\d{1,2})?))?/,
       );
+      const govAfterMatch = text.match(
+        /(?:国补领后价|国补价|补贴领后价|政府补贴价)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)(?:\s*[¥￥]\s*(\d+(?:\.\d{1,2})?))?/,
+      );
+      const govRowMatch = govBeforeMatch || govAfterMatch;
       if (govRowMatch?.[1]) {
         const parsedFinal = parseCleanNumericPrice(govRowMatch[1]);
         const parsedOrigin = parseCleanNumericPrice(govRowMatch[2]);
-        if (parsedFinal > 0) finalPrice = parsedFinal;
-        if (parsedOrigin > parsedFinal) pagePrice = parsedOrigin;
+        if (parsedFinal > 0) {
+          explicitFinalPrice = parsedFinal;
+          hasExplicitSubsidyPrice = true;
+        }
+        if (parsedOrigin > parsedFinal) {
+          originPrice = Math.max(originPrice, parsedOrigin);
+        }
       }
 
-      const handRowMatch = text.match(
-        /(?:到手价|预估到手价|券后价)\s*¥?\s*(\d+(?:\.\d{1,2})?)(?:\s*¥?\s*(\d+(?:\.\d{1,2})?))?/,
-      );
-      if (!finalPrice && handRowMatch?.[1]) {
-        finalPrice = parseCleanNumericPrice(handRowMatch[1]);
-        const p2 = parseCleanNumericPrice(handRowMatch[2]);
-        if (p2 > finalPrice && !pagePrice) pagePrice = p2;
+      // 2b. 到手价 / 预估到手价 / 券后价（数字在前 或 标签在前）
+      if (!hasExplicitSubsidyPrice) {
+        const handBeforeMatch = text.match(
+          /[¥￥]\s*(\d+(?:\.\d{1,2})?)\s*(?:到手价|预估到手价|券后价|折后价|PLUS到手价)(?:\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?))?/,
+        );
+        const handAfterMatch = text.match(
+          /(?:到手价|预估到手价|券后价|折后价|PLUS到手价)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)(?:\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?))?/,
+        );
+        if (handBeforeMatch?.[1]) {
+          const p1 = parseCleanNumericPrice(handBeforeMatch[1]);
+          const p2 = parseCleanNumericPrice(handBeforeMatch[2]);
+          if (p1 > 0) explicitFinalPrice = p1;
+          if (p2 > p1) originPrice = Math.max(originPrice, p2);
+        } else if (handAfterMatch?.[1]) {
+          const p1 = parseCleanNumericPrice(handAfterMatch[1]);
+          const p2 = parseCleanNumericPrice(handAfterMatch[2]);
+          if (p1 > 0 && p2 > 0) {
+            explicitFinalPrice = Math.min(p1, p2);
+            originPrice = Math.max(originPrice, Math.max(p1, p2));
+          } else if (p1 > 0) {
+            explicitFinalPrice = p1;
+          }
+        }
+      }
+
+      if (!explicitFinalPrice && domExtracted.handPriceElText) {
+        const domHand = parseCleanNumericPrice(domExtracted.handPriceElText);
+        if (domHand > 0) explicitFinalPrice = domHand;
       }
 
       const domSubMatch =
-        text.match(/国家补贴\s*[|｜]?\s*领后减\s*¥?\s*(\d+(?:\.\d{1,2})?)/) ||
-        text.match(/领后减\s*¥?\s*(\d+(?:\.\d{1,2})?)/) ||
-        text.match(/国家补贴[^¥\d]{0,16}(?:立减|减|省)\s*¥?\s*(\d+(?:\.\d{1,2})?)/);
+        text.match(/国家补贴\s*[|｜]?\s*领后减\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/) ||
+        text.match(/领后减\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/) ||
+        text.match(/国家补贴[^¥￥\d]{0,16}(?:立减|补贴)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/);
       if (domSubMatch?.[1]) {
         const subVal = parseCleanNumericPrice(domSubMatch[1]);
         if (subVal > 0) {
           subsidyDiscount = subVal;
           subsidyLabel = `国家补贴 | 领后减 ¥${subVal}`;
+          hasExplicitSubsidyPrice = true;
         }
       }
 
       const jpVal = parseCleanNumericPrice(domExtracted.jpText || domExtracted.pPriceText);
-      const originVal = parseCleanNumericPrice(domExtracted.pageOriginPriceText);
+      const domOriginVal = parseCleanNumericPrice(domExtracted.pageOriginPriceText);
 
-      if (!finalPrice && jpVal > 0) {
-        finalPrice = jpVal;
+      if (jpVal > 0 && !jdSellingPrice) jdSellingPrice = jpVal;
+      if (domOriginVal > 0) originPrice = Math.max(originPrice, domOriginVal);
+
+      // 确定最终实际到手价 (finalPrice) 与页面日常标价 (pagePrice)
+      let finalPrice = explicitFinalPrice || jdSellingPrice || originPrice;
+      // 如果既有京东价 jdSellingPrice 又有 explicitFinalPrice，且两者不同，较小的为实际到手价，较大的作为日常标价
+      if (explicitFinalPrice > 0 && jdSellingPrice > 0) {
+        finalPrice = Math.min(explicitFinalPrice, jdSellingPrice);
       }
-      if (!pagePrice) {
-        if (originVal > finalPrice) pagePrice = originVal;
-        else if (jpVal > finalPrice) pagePrice = jpVal;
-        else if (finalPrice > 0 && subsidyDiscount > 0) {
-          pagePrice = Number((finalPrice + subsidyDiscount).toFixed(2));
-        } else {
-          pagePrice = finalPrice;
-        }
+
+      let pagePrice = originPrice > finalPrice ? originPrice : jdSellingPrice > finalPrice ? jdSellingPrice : finalPrice;
+      if (pagePrice <= finalPrice && finalPrice > 0 && subsidyDiscount > 0) {
+        pagePrice = Number((finalPrice + subsidyDiscount).toFixed(2));
       }
 
       if (finalPrice > 0 && subsidyDiscount > 0) {
@@ -538,6 +621,8 @@ async function scrapeJdPcRichDetail(skuId: string): Promise<JdPcRichDetail | nul
         if (pagePrice > preSub + 0.05) {
           couponPrice = preSub;
         }
+      } else if (finalPrice > 0 && pagePrice > finalPrice + 0.05 && !hasExplicitSubsidyPrice) {
+        couponPrice = finalPrice;
       }
 
       if (pagePrice > 0 || finalPrice > 0) {
@@ -547,11 +632,12 @@ async function scrapeJdPcRichDetail(skuId: string): Promise<JdPcRichDetail | nul
           couponPrice,
           subsidyDiscount,
           subsidyLabel,
+          hasExplicitSubsidyPrice,
           coupons,
           title: domExtracted.skuName || undefined,
           shopName: domExtracted.shopName || undefined,
           spec: domExtracted.selectedColor || undefined,
-          htmlText: `${domExtracted.summaryText}\n${wareBusinessRaw.slice(0, 8000)}`,
+          htmlText: `${domExtracted.priceAreaText}\n${domExtracted.quanAreaText}`,
         };
       }
     } finally {
@@ -663,11 +749,7 @@ async function scrapeJdProduct(identity: ProductIdentity): Promise<{
     parseCleanNumericPrice(itemInfo.priceFloor?.ext?.realPriceExt?.ORIGINAL?.salePrice) ||
     parseCleanNumericPrice(itemInfo.priceFloor?.price);
 
-  const hasGovBanner =
-    Boolean(itemInfo.newBanner?.fData?.link?.includes('gov-subsidy.jd.com')) ||
-    /国补|国家补贴|政府补贴/.test(JSON.stringify(itemInfo.newBanner || {}));
-
-  // 通过服务端无头浏览器采集 PC 详情页的真实「国补领后价」「日常标价」与「国家补贴立减金额」
+  // 通过服务端无头浏览器采集 PC 详情页的真实「国补领后价 / 到手价」「日常标价」与「国家补贴立减金额」
   const pcRich = await scrapeJdPcRichDetail(skuId);
   if (pcRich?.title && title.startsWith('京东商品 #')) title = pcRich.title;
   if (pcRich?.shopName && shopName === '京东自营 / 官方旗舰店') shopName = pcRich.shopName;
@@ -680,18 +762,22 @@ async function scrapeJdProduct(identity: ProductIdentity): Promise<{
     );
   }
 
-  const combinedText = `${html}\n${pcRich?.htmlText || ''}\n${hasGovBanner ? '国家补贴 登录最高省15%' : ''}`;
+  const bannerText = [itemInfo.newBanner?.bannerName, itemInfo.newBanner?.fData?.bannerName, itemInfo.newBanner?.fData?.rightDownText]
+    .filter(Boolean)
+    .join(' ');
+  const combinedText = `${pcRich?.htmlText || ''}\n${bannerText}`;
   const promo = evaluateCouponsAndSubsidy({
     title,
     cat1,
     cat2,
     pagePrice,
     htmlText: combinedText,
-    observedFinalPrice: pcRich?.finalPrice,
+    observedFinalPrice: pcRich?.finalPrice || mobilePrice,
     observedCouponPrice: pcRich?.couponPrice,
     observedSubsidyDiscount: pcRich?.subsidyDiscount,
     observedSubsidyLabel: pcRich?.subsidyLabel,
     observedCoupons: pcRich?.coupons,
+    hasExplicitSubsidyPrice: pcRich?.hasExplicitSubsidyPrice,
   });
 
   return {
