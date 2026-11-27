@@ -390,7 +390,19 @@ async function scrapeJdMobileQuote(
         const width = Math.min(innerWidth, Math.ceil(right) + 2) - x;
         const height = Math.min(innerHeight, Math.ceil(bottom) + 4) - y;
         if (width <= 0 || height <= 0 || width > 350 || height > 95) return null;
-        return { label: label.innerText.trim(), text: value.innerText.trim(), clip: { x, y, width, height } };
+        const promotions = new Set<string>();
+        for (const row of document.querySelectorAll<HTMLElement>('#discountFloor .prom_item')) {
+          const category = row.querySelector<HTMLElement>('.de_tag')?.innerText.trim() ?? '';
+          if (/赠品|白条|分期|银行卡|以旧换新|支付/.test(category)) continue;
+          for (const term of row.querySelectorAll<HTMLElement>('.de_tag, .de_span')) {
+            if (!term.checkVisibility({ visibilityProperty: true, opacityProperty: true })) continue;
+            const text = term.innerText.replace(/\s+/g, '').trim();
+            if (/^(?:单品)?满(?:1件|\d+(?:\.\d{1,2})?元?)减\d+(?:\.\d{1,2})?元?$/.test(text)) {
+              promotions.add(text);
+            }
+          }
+        }
+        return { label: label.innerText.trim(), text: value.innerText.trim(), clip: { x, y, width, height }, promotions: [...promotions] };
       }, skuId);
       if (!quote || !onProduct()) return null;
       const kind = jdOfferLabelKind(quote.label);
@@ -406,7 +418,7 @@ async function scrapeJdMobileQuote(
         subsidyDiscount: 0,
         subsidyLabel: kind === 'subsidy' ? quote.label : null,
         hasExplicitSubsidyPrice: kind === 'subsidy',
-        coupons: [],
+        coupons: quote.promotions,
         htmlText: '',
       };
     } finally {

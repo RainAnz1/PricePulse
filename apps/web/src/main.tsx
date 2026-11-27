@@ -365,15 +365,17 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
 
         <div className="apple-metric-tile">
           <div className="tile-top">
-            <span>优惠券减免</span>
+            <span>商品优惠</span>
             {hasPrice && product.couponDiscount > 0 && <span className="apple-badge neutral">-¥{product.couponDiscount}</span>}
           </div>
-          <div className="tile-price-sm">
-            {product.couponPrice !== null ? `¥${formatPrice(product.couponPrice)}` : '待采集'}
-          </div>
-          {hasPrice && <div className="tile-caption">
-            {product.coupons.length > 0 ? product.coupons.join(' · ') : '暂未检出可用店铺券'}
-          </div>}
+          {(product.couponPrice !== null || product.coupons.length === 0) && (
+            <div className="tile-price-sm">
+              {product.couponPrice !== null ? `¥${formatPrice(product.couponPrice)}` : '待采集'}
+            </div>
+          )}
+          {product.coupons.map(promotion => (
+            <div key={promotion} className="tile-caption">{promotion}</div>
+          ))}
         </div>
 
         <div className="apple-metric-tile">

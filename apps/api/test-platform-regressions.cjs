@@ -526,7 +526,12 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
         async waitForTimeout() {},
         async evaluate(_task, skuId) {
           assert.equal(skuId, '12345678');
-          return { label: '国补领后价', text: mobilePriceText, clip: { x: 40, y: 55, width: 84, height: 34 } };
+          return {
+            label: '国补领后价',
+            text: mobilePriceText,
+            clip: { x: 40, y: 55, width: 84, height: 34 },
+            promotions: ['满3000元减200元', '单品满1件减100元'],
+          };
         },
         async close() {},
       };
@@ -542,6 +547,9 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
   assert.equal(quote.subsidyLabel, '国补领后价');
   assert.equal(quote.subsidyPrice, 2898);
   assert.equal(quote.subsidyDiscount, 0);
+  assert.deepEqual(quote.coupons, ['满3000元减200元', '单品满1件减100元']);
+  assert.equal(quote.couponDiscount, 0);
+  assert.equal(quote.couponPrice, null);
   assert.deepEqual(visited, [url]);
   assert.deepEqual(scrolls, [{ block: 'center', inline: 'nearest', behavior: 'instant' }]);
 
