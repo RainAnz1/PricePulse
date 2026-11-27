@@ -1,12 +1,12 @@
 import { BadRequestException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { readJdDisplayedPrice, resolveJdPrice } from './jd-price';
+import { jdOfferLabelKind, jdVisiblePriceShape, readJdDisplayedPrice, readJdPriceImage, resolveJdPrice } from './jd-price';
 import {
   closeProductPageOnTimeout, evaluateCouponsAndSubsidy, normalizeImageUrl, parseCleanNumericPrice, productLogger,
 } from './product-collection';
 import type { CollectedProduct } from './product-collection';
 import type { ProductIdentity } from './product-url';
-import { getJdHeadlessContext, loadPersistedJdSession } from './sessions';
+import { getJdHeadlessContext, hasJdMobileAuth, loadPersistedJdSession } from './sessions';
 
 interface JdMobileItemInfo {
   product?: {
@@ -58,7 +58,7 @@ interface JdMobileItemInfo {
 const MOBILE_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-interface JdPcRichDetail {
+interface JdRichDetail {
   pagePrice: number;
   finalPrice: number | null;
   couponPrice: number;
@@ -99,7 +99,7 @@ function jdProductPageIssue(url: string): JdCollectionCode | null {
 
 async function scrapeJdPcRichDetail(
   skuId: string, signal: AbortSignal,
-): Promise<JdPcRichDetail | JdCollectionCode | null> {
+): Promise<JdRichDetail | JdCollectionCode | null> {
   let priceApiIssue: JdCollectionCode | null = null;
   try {
     const context = await getJdHeadlessContext();
@@ -333,6 +333,83 @@ async function scrapeJdPcRichDetail(
   return priceApiIssue;
 }
 
+async function scrapeJdMobileQuote(
+  skuId: string, referencePrice: number, signal: AbortSignal,
+): Promise<JdRichDetail | null> {
+  try {
+    const context = await getJdHeadlessContext();
+    signal.throwIfAborted();
+    const page = await context.newPage();
+    const detachTimeout = closeProductPageOnTimeout(page, signal);
+    const mobileUrl = new URL(`https://item.m.jd.com/product/${skuId}.html`);
+    const onProduct = () => {
+      const url = new URL(page.url());
+      return url.origin === mobileUrl.origin && url.pathname === mobileUrl.pathname;
+    };
+    try {
+      const response = await page.goto(mobileUrl.href, { waitUntil: 'domcontentloaded', timeout: 10500 });
+      if (!response?.ok() || !onProduct()) return null;
+      await page.locator('#priceSpec #defaultDesc + span').scrollIntoViewIfNeeded({ timeout: 4000 });
+      await page.waitForFunction(() => document.fonts.status === 'loaded', undefined, { timeout: 1500 });
+      const quote = await page.evaluate(id => {
+        const item = (window as Window & { _itemInfo?: { product?: { skuId?: string | number } } })._itemInfo;
+        const label = document.querySelector<HTMLElement>('#priceSpec #defaultDesc');
+        const value = label?.nextElementSibling as HTMLElement | null | undefined;
+        if (String(item?.product?.skuId) !== id ||
+            !label?.checkVisibility({ visibilityProperty: true, opacityProperty: true }) ||
+            !value?.checkVisibility({ visibilityProperty: true, opacityProperty: true })) {
+          return null;
+        }
+        const walker = document.createTreeWalker(value, NodeFilter.SHOW_TEXT);
+        let left = Infinity, top = Infinity, right = 0, bottom = 0;
+        for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
+          const start = node.data.search(/[\d\uE000-\uF8FF.,]/);
+          if (start < 0) continue;
+          const range = document.createRange();
+          range.setStart(node, start);
+          range.setEnd(node, node.length);
+          const r = range.getBoundingClientRect();
+          if (!r.width || !r.height) continue;
+          left = Math.min(left, r.left);
+          top = Math.min(top, r.top);
+          right = Math.max(right, r.right);
+          bottom = Math.max(bottom, r.bottom);
+        }
+        if (right <= left || bottom <= top) return null;
+        const x = Math.max(0, Math.floor(left));
+        const y = Math.max(0, Math.floor(top) - 4);
+        const width = Math.min(innerWidth, Math.ceil(right) + 2) - x;
+        const height = Math.min(innerHeight, Math.ceil(bottom) + 4) - y;
+        if (width <= 0 || height <= 0 || width > 350 || height > 95) return null;
+        return { label: label.innerText.trim(), text: value.innerText.trim(), clip: { x, y, width, height } };
+      }, skuId);
+      if (!quote || !onProduct()) return null;
+      const kind = jdOfferLabelKind(quote.label);
+      const shape = jdVisiblePriceShape(quote.text);
+      if (!kind || !shape) return null;
+      const plainPrice = /^(?:[¥￥]\s*)?\d[\d,.]*$/.test(quote.text) ? parseCleanNumericPrice(quote.text) : 0;
+      const price = plainPrice || await readJdPriceImage(await page.screenshot({ clip: quote.clip, timeout: 3000 }), shape, signal);
+      if (!price || !onProduct() || (referencePrice > 0 && price > referencePrice)) return null;
+      return {
+        pagePrice: referencePrice || price,
+        finalPrice: price,
+        couponPrice: 0,
+        subsidyDiscount: 0,
+        subsidyLabel: kind === 'subsidy' ? quote.label : null,
+        hasExplicitSubsidyPrice: kind === 'subsidy',
+        coupons: [],
+        htmlText: '',
+      };
+    } finally {
+      detachTimeout();
+      await page.close().catch(() => {});
+    }
+  } catch {
+    signal.throwIfAborted();
+    return null;
+  }
+}
+
 export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSignal): Promise<CollectedProduct> {
   const startedAt = Date.now();
   const session = loadPersistedJdSession();
@@ -414,14 +491,16 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     parseCleanNumericPrice(itemInfo.priceFloor?.ext?.realPriceExt?.ORIGINAL?.salePrice) ||
     parseCleanNumericPrice(itemInfo.priceFloor?.price);
 
-  // 通过服务端无头浏览器采集 PC 详情页的真实「国补领后价 / 到手价」「日常标价」与「国家补贴立减金额」
-  const pcResult = await scrapeJdPcRichDetail(skuId, signal);
-  const pcRich = typeof pcResult === 'string' ? null : pcResult;
-  if (pcRich?.title && title.startsWith('京东商品 #')) title = pcRich.title;
-  if (pcRich?.shopName && shopName === '京东自营 / 官方旗舰店') shopName = pcRich.shopName;
-  if (pcRich?.spec && spec === '默认规格') spec = pcRich.spec;
+  // 优先读取已登录的手机商品页，缺少报价时沿用电脑端采集。
+  const mobileQuote = hasJdMobileAuth(session?.cookies) && !session?.authExpiredAt
+    ? await scrapeJdMobileQuote(skuId, mobilePrice, signal) : null;
+  const pcResult = mobileQuote ? null : await scrapeJdPcRichDetail(skuId, signal);
+  const quote = mobileQuote ?? (typeof pcResult === 'string' ? null : pcResult);
+  if (quote?.title && title.startsWith('京东商品 #')) title = quote.title;
+  if (quote?.shopName && shopName === '京东自营 / 官方旗舰店') shopName = quote.shopName;
+  if (quote?.spec && spec === '默认规格') spec = quote.spec;
 
-  const pagePrice = pcRich?.pagePrice || mobilePrice;
+  const pagePrice = quote?.pagePrice || mobilePrice;
   if (!pagePrice || pagePrice <= 0) {
     const pcIssue = typeof pcResult === 'string' ? pcResult : null;
     const mobileIssue = jdProductPageIssue(res?.url ?? '') ??
@@ -445,19 +524,19 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
   const bannerText = [itemInfo.newBanner?.bannerName, itemInfo.newBanner?.fData?.bannerName, itemInfo.newBanner?.fData?.rightDownText]
     .filter(Boolean)
     .join(' ');
-  const combinedText = `${pcRich?.htmlText || ''}\n${bannerText}`;
+  const combinedText = `${quote?.htmlText || ''}\n${bannerText}`;
   const promo = evaluateCouponsAndSubsidy({
     title,
     cat1,
     cat2,
     pagePrice,
     htmlText: combinedText,
-    observedFinalPrice: pcRich?.finalPrice ?? undefined,
-    observedCouponPrice: pcRich?.couponPrice,
-    observedSubsidyDiscount: pcRich?.subsidyDiscount,
-    observedSubsidyLabel: pcRich?.subsidyLabel,
-    observedCoupons: pcRich?.coupons,
-    hasExplicitSubsidyPrice: pcRich?.hasExplicitSubsidyPrice,
+    observedFinalPrice: quote?.finalPrice ?? undefined,
+    observedCouponPrice: quote?.couponPrice,
+    observedSubsidyDiscount: quote?.subsidyDiscount,
+    observedSubsidyLabel: quote?.subsidyLabel,
+    observedCoupons: quote?.coupons,
+    hasExplicitSubsidyPrice: quote?.hasExplicitSubsidyPrice,
     useObservedPriceOnly: true,
   });
 
@@ -472,6 +551,6 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     stockText,
     pagePrice,
     ...promo,
-    finalPrice: pcRich?.finalPrice ?? null,
+    finalPrice: quote?.finalPrice ?? null,
   };
 }

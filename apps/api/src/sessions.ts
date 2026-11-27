@@ -85,6 +85,8 @@ const loginPages = {
   jd: 'https://passport.jd.com/new/login.aspx?ReturnUrl=https%3A%2F%2Fwww.jd.com%2F',
   taobao: 'https://login.taobao.com/havanaone/login/login.htm?bizName=taobao&sub=true',
 };
+const jdMobileLoginUrl = 'https://plogin.m.jd.com/login/login?appid=100&returnurl=https%3A%2F%2Fm.jd.com%2F';
+const jdMobileLoginPages = new WeakSet<Page>();
 
 function platformUrl(value: string | undefined, platform: Platform, base = loginPages[platform]): URL | null {
   try {
@@ -676,8 +678,9 @@ export async function getJdHeadlessContext(): Promise<BrowserContext> {
 async function getOrOpenHeadlessJdLoginPage(forceLoginUrl = false): Promise<Page> {
   const context = await getJdHeadlessContext();
   if (headlessLoginPage && !headlessLoginPage.isClosed()) {
+    const wasMobile = jdMobileLoginPages.delete(headlessLoginPage);
     const currentUrl = headlessLoginPage.url();
-    if (!forceLoginUrl && currentUrl && currentUrl !== 'about:blank') {
+    if (!wasMobile && !forceLoginUrl && currentUrl && currentUrl !== 'about:blank') {
       return headlessLoginPage;
     }
     if (forceLoginUrl && currentUrl.includes('passport.jd.com/new/login.aspx')) {
@@ -699,10 +702,14 @@ async function getOrOpenHeadlessJdLoginPage(forceLoginUrl = false): Promise<Page
 async function syncCookiesFromHeadlessContext(
   extraCookies: Record<string, string> = {},
   source: 'qrcode' | 'sms' = 'qrcode',
-  extraMeta?: { mobile?: string; lastCheckCode?: number; lastValidateReturnCode?: number },
+  extraMeta?: { mobile?: string; lastCheckCode?: number; lastValidateReturnCode?: number; mobileLogin?: boolean },
 ): Promise<PersistedJdSession | null> {
   const version = authVersion.jd;
   const context = await getJdHeadlessContext();
+  const mobileCredentials = extraMeta?.mobileLogin
+    ? Object.fromEntries((await context.cookies('https://item.m.jd.com/')).map(cookie => [cookie.name, cookie.value]))
+    : undefined;
+  if (extraMeta?.mobileLogin && !hasJdMobileAuth(mobileCredentials)) return null;
   let browserCookies = (await context.cookies()).filter(cookie => accountDomains.jd.test(cookie.domain));
 
   const initialMap: Record<string, string> = { ...extraCookies };
@@ -718,7 +725,7 @@ async function syncCookiesFromHeadlessContext(
   let pageNickname = '';
   let pagePin = '';
   if (
-    !initialMap.unick || !initialMap.pin
+    !extraMeta?.mobileLogin && (!initialMap.unick || !initialMap.pin)
   ) {
     try {
       const page = headlessLoginPage;
@@ -777,8 +784,15 @@ async function syncCookiesFromHeadlessContext(
     }
   }
 
+  if (mobileCredentials) {
+    cookieMap.pt_key = mobileCredentials.pt_key;
+    cookieMap.pt_pin = mobileCredentials.pt_pin;
+  }
+
   const header = buildCookieHeader(cookieMap);
-  const verified = await verifyJdCookiesWithLoginService(header);
+  const verified = extraMeta?.mobileLogin
+    ? { authenticated: true, pin: decodeCookieValue(cookieMap.pt_pin), nickname: '', refreshedCookies: {} }
+    : await verifyJdCookiesWithLoginService(header);
   if (!verified.authenticated || version !== authVersion.jd) return null;
   const verifiedAt = new Date().toISOString();
   Object.assign(cookieMap, verified.refreshedCookies);
@@ -854,6 +868,9 @@ async function checkPersistedJdSession(): Promise<JdSessionCheck> {
     });
     return { state: 'logged_in', session: updated, message: `京东会话已验证（账号：${updated.nickname}）` };
   }
+  if (hasJdMobileAuth(session.cookies)) {
+    return { state: 'unverified', session, message: '京东手机版会话已保存，暂未确认电脑端登录' };
+  }
   if (!verified.rejected) {
     return { state: 'unverified', session, message: '暂时无法向京东确认登录状态，已保留会话，稍后可重试' };
   }
@@ -872,7 +889,11 @@ async function checkPersistedJdSession(): Promise<JdSessionCheck> {
 }
 
 function hasJdAuth(cookies: Record<string, string>): boolean {
-  return Boolean(cookies.thor || (cookies.pt_key && cookies.pt_pin));
+  return Boolean(cookies.thor || hasJdMobileAuth(cookies));
+}
+
+export function hasJdMobileAuth(cookies?: Record<string, string>): boolean {
+  return Boolean(cookies?.pt_key && cookies.pt_key !== 'deleted' && cookies.pt_pin && cookies.pt_pin !== 'deleted');
 }
 
 function hasTaobaoAuth(cookies: Record<string, string>): boolean {
@@ -1036,7 +1057,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
 
   private async getOrCreateRemotePage(
     platform: Platform,
-    options?: { keepCurrent?: boolean },
+    options?: { keepCurrent?: boolean; jdMobile?: boolean },
   ): Promise<Page> {
     const context = await getSharedHeadlessContext();
     let page = platform === 'jd' ? headlessLoginPage : headlessTbPage;
@@ -1045,8 +1066,12 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
       if (platform === 'jd') headlessLoginPage = page;
       else headlessTbPage = page;
     }
-    if (!options?.keepCurrent || !platformUrl(page.url(), platform)) {
-      await page.goto(loginPages[platform], { waitUntil: 'domcontentloaded', timeout: 15000 })
+    const wasMobile = jdMobileLoginPages.has(page);
+    const mobileLogin = platform === 'jd' && (options?.jdMobile ?? wasMobile);
+    if (mobileLogin) jdMobileLoginPages.add(page);
+    else jdMobileLoginPages.delete(page);
+    if (wasMobile !== mobileLogin || !options?.keepCurrent || !platformUrl(page.url(), platform)) {
+      await page.goto(mobileLogin ? jdMobileLoginUrl : loginPages[platform], { waitUntil: 'domcontentloaded', timeout: 15000 })
         .catch(() => {});
     }
     return page;
@@ -1069,14 +1094,17 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     const url = platformUrl(page.url(), platform);
     const host = url?.hostname;
     const onJdChallenge = host === 'aq.jd.com' || host === 'safe.jd.com' || host === 'cfe.m.jd.com';
+    const mobileLogin = jdMobileLoginPages.has(page);
+    const returnedFromMobileLogin = host === 'm.jd.com' || host === 'item.m.jd.com' || host === 'my.m.jd.com';
     const dragging = this.remoteBrowser.isDragging(platform, page);
-    if (!dragging && platform === 'jd' && host && !onJdChallenge) {
-      const saved = await syncCookiesFromHeadlessContext({}, source, { mobile });
+    if (!dragging && platform === 'jd' && host && !onJdChallenge && (!mobileLogin || returnedFromMobileLogin)) {
+      const saved = await syncCookiesFromHeadlessContext({}, source, { mobile, mobileLogin });
       if (saved) {
         activeJdQrSession = null;
         await this.closeCompletedLoginPage('jd', page);
         return this.jdSessionResponse({
-          state: 'logged_in', session: saved, message: `京东登录成功（账号：${saved.nickname}）`,
+          state: 'logged_in', session: saved,
+          message: mobileLogin ? '京东手机版登录成功，可以刷新商品价格' : `京东登录成功（账号：${saved.nickname}）`,
         });
       }
     }
@@ -1122,14 +1150,18 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
   @Post(':platform/remote/start')
   async startRemoteBrowser(
     @Param('platform') input: string,
-    @Body() body: { keepCurrent?: boolean; targetUrl?: never },
+    @Body() body: { keepCurrent?: boolean; targetUrl?: never; jdMobile?: boolean },
     @Req() req: Request,
   ) {
     validateOrigin(req);
     const platform = platformOf(input);
     if (body?.targetUrl !== undefined) throw new BadRequestException('只支持平台官方登录页');
+    if (body?.jdMobile !== undefined && (platform !== 'jd' || typeof body.jdMobile !== 'boolean')) {
+      throw new BadRequestException('京东手机版登录参数无效');
+    }
     await this.getOrCreateRemotePage(platform, {
       keepCurrent: body?.keepCurrent ?? true,
+      jdMobile: body?.jdMobile,
     });
     return this.captureRemoteFrameAndCheckAuth(platform);
   }
@@ -1817,6 +1849,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
       lastKeepAliveAt: session?.lastKeepAliveAt,
       keepAliveCount: session?.keepAliveCount ?? 0,
       cookieCount: session ? Object.keys(session.cookies).length : 0,
+      mobileLoginReady: hasJdMobileAuth(session?.cookies),
       storagePath: session ? getJdSessionFilePath() : undefined,
       message,
     };

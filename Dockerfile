@@ -7,6 +7,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     fonts-noto-cjk \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     ca-certificates \
     curl \
     tini \

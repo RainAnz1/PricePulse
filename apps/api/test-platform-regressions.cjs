@@ -4,6 +4,7 @@ const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require(
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { test } = require('node:test');
+const { chromium } = require('playwright');
 const { readJdDisplayedPrice, resolveJdPrice } = require('./dist/jd-price');
 const { scrapeJdProduct } = require('./dist/jd-product');
 const { saveFeishuConfig } = require('./dist/feishu');
@@ -177,6 +178,69 @@ test('remote login rejects cross-origin requests and allows same-origin traffic 
   await assert.rejects(controller.startRemoteBrowser('jd', destination, request('https://pricepulse.example.org', 'same-origin')), {
     status: 400,
   });
+});
+
+test('JD mobile login saves credentials only after returning to JD with both scoped cookies', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'pricepulse-mobile-login-'));
+  const oldRoot = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = root;
+  const controller = new SessionsController();
+  t.after(async () => {
+    await controller.onModuleDestroy();
+    if (oldRoot === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = oldRoot;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const cookie = (name, value) => ({
+    name, value, domain: '.jd.com', path: '/', expires: -1, httpOnly: true, secure: true, sameSite: 'Lax',
+  });
+  const desktop = cookie('thor', 'desktop-fixture');
+  const cookies = [desktop];
+  savePersistedJdSession({ cookies: { thor: desktop.value } });
+  const page = Object.assign(new EventEmitter(), {
+    href: 'about:blank',
+    closed: false,
+    async goto(url) { this.href = url; },
+    url() { return this.href; },
+    isClosed() { return this.closed; },
+    async close() { this.closed = true; this.emit('close'); },
+    async screenshot() { return Buffer.from('fixture'); },
+    async title() { return '京东'; },
+  });
+  const context = Object.assign(new EventEmitter(), {
+    pages: () => [page],
+    async cookies(scope) {
+      if (scope !== undefined) assert.equal(scope, 'https://item.m.jd.com/');
+      return cookies;
+    },
+    async newPage() { return page; },
+    async close() { this.emit('close'); },
+  });
+  t.mock.method(chromium, 'launchPersistentContext', async () => context);
+  const request = { get: name => name === 'sec-fetch-site' ? 'same-origin' : undefined };
+  const start = await controller.startRemoteBrowser('jd', { jdMobile: true }, request);
+  assert.equal(start.state, 'verify_required');
+  assert.equal(start.url, 'https://plogin.m.jd.com/login/login');
+
+  page.href = 'https://m.jd.com/';
+  cookies.push(cookie('pt_key', 'key-fixture'));
+  assert.equal((await controller.getRemoteBrowserFrame('jd', request)).state, 'verify_required');
+  assert.deepEqual(loadPersistedJdSession().cookies, { thor: desktop.value });
+
+  cookies.push(cookie('pt_pin', 'mobile-fixture'));
+  const saved = await controller.getRemoteBrowserFrame('jd', request);
+  assert.equal(saved.state, 'logged_in');
+  assert.equal(saved.mobileLoginReady, true);
+  assert.deepEqual(loadPersistedJdSession().cookies, {
+    thor: desktop.value, pt_key: 'key-fixture', pt_pin: 'mobile-fixture',
+  });
+  assert.equal(page.closed, true);
+
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ Identity: { IsAuthenticated: false } }));
+  const status = await controller.getJdStatus();
+  assert.equal(status.mobileLoginReady, true);
+  assert.equal(loadPersistedJdSession().authExpiredAt, undefined);
 });
 
 test('temporary JD failures preserve the session and confirmed expiry sends one notification', async t => {
@@ -426,6 +490,58 @@ test('JD uses the observed mobile quote when the page object has a trailing comm
   assert.equal(product.pagePrice, 159);
   assert.equal(product.finalPrice, null);
   assert.equal(page.close.mock.callCount(), 1);
+});
+
+test('JD accepts a labeled mobile quote and leaves masked or unavailable prices pending', async t => {
+  const url = 'https://item.m.jd.com/product/12345678.html';
+  const visited = [];
+  let mobilePriceText = '¥2,898.00';
+  t.mock.method(sessionModule, 'loadPersistedJdSession', () => ({
+    cookies: { pt_key: 'fixture-key', pt_pin: 'fixture-pin' },
+  }));
+  t.mock.method(sessionModule, 'getJdHeadlessContext', async () => ({
+    async newPage() {
+      let destination;
+      return {
+        on() {},
+        async goto(href) {
+          destination = href;
+          visited.push(href);
+          return { ok: () => true };
+        },
+        url: () => destination === url ? url : 'https://pc-frequent-pro.pf.jd.com/',
+        locator(selector) {
+          assert.equal(selector, '#priceSpec #defaultDesc + span');
+          return { scrollIntoViewIfNeeded: async () => {} };
+        },
+        async waitForFunction() {},
+        async waitForTimeout() {},
+        async evaluate(_task, skuId) {
+          assert.equal(skuId, '12345678');
+          return { label: '国补领后价', text: mobilePriceText, clip: { x: 40, y: 55, width: 84, height: 34 } };
+        },
+        async close() {},
+      };
+    },
+  }));
+  t.mock.method(globalThis, 'fetch', async () => new Response(
+    'window._itemInfo = ({"product":{"skuName":"测试商品"},"priceFloor":{"ext":{"jdPrice":"3698"}}});',
+  ));
+  const identity = { id: '12345678', skuId: '12345678', platform: 'jd', canonicalUrl: url };
+  const quote = await scrapeJdProduct(identity, new AbortController().signal);
+  assert.equal(quote.pagePrice, 3698);
+  assert.equal(quote.finalPrice, 2898);
+  assert.equal(quote.subsidyLabel, '国补领后价');
+  assert.equal(quote.subsidyPrice, 2898);
+  assert.equal(quote.subsidyDiscount, 0);
+  assert.deepEqual(visited, [url]);
+
+  mobilePriceText = '¥????.??';
+  const pending = await scrapeJdProduct(identity, new AbortController().signal);
+  assert.equal(pending.pagePrice, 3698);
+  assert.equal(pending.finalPrice, null);
+  assert.equal(pending.subsidyPrice, null);
+  assert.deepEqual(visited.slice(1), [url, 'https://item.jd.com/12345678.html']);
 });
 
 test('JD keeps the desktop subsidized quote, reference price and applied subsidy distinct', async t => {

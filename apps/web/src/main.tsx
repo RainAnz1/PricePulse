@@ -60,6 +60,7 @@ interface PlatformSessionInfo {
   lastKeepAliveAt?: string;
   keepAliveCount?: number;
   cookieCount?: number;
+  mobileLoginReady?: boolean;
   storagePath?: string;
   message: string;
 }
@@ -716,12 +717,14 @@ function RemoteBrowserViewport({
   onLoggedIn,
   onMessage,
   verificationToken,
+  jdMobile = false,
 }: {
   platform: 'jd' | 'taobao';
   initialFrame: RemoteBrowserFrame | null;
   onLoggedIn: (session: PlatformSessionInfo) => void;
   onMessage: (msg: string) => void;
   verificationToken?: string;
+  jdMobile?: boolean;
 }) {
   const [frame, setFrame] = useState<RemoteBrowserFrame | null>(initialFrame);
   const [loading, setLoading] = useState(false);
@@ -763,7 +766,7 @@ function RemoteBrowserViewport({
       } : {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keepCurrent: !resetToLogin }),
+        body: JSON.stringify({ keepCurrent: !resetToLogin, ...(platform === 'jd' ? { jdMobile } : {}) }),
       });
       const data = await readFrame(res);
       if (data.state === 'ready') {
@@ -1169,7 +1172,7 @@ function App() {
   const [jdSession, setJdSession] = useState<PlatformSessionInfo | null>(null);
   const [jdQr, setJdQr] = useState<JdQrCodeState | null>(null);
   const [jdRemoteFrame, setJdRemoteFrame] = useState<RemoteBrowserFrame | null>(null);
-  const [authTab, setAuthTab] = useState<'qrcode' | 'sms' | 'remote'>('qrcode');
+  const [authTab, setAuthTab] = useState<'qrcode' | 'sms' | 'remote' | 'mobile'>('qrcode');
   const [showJdAuthPanel, setShowJdAuthPanel] = useState(false);
   const [mobileInput, setMobileInput] = useState('');
   const [smsCodeInput, setSmsCodeInput] = useState('');
@@ -1286,7 +1289,7 @@ function App() {
       .then((data: PlatformSessionInfo | null) => {
         if (data) {
           setJdSession(data);
-          if (data.state === 'logged_in') {
+          if (data.state === 'logged_in' || data.mobileLoginReady) {
             setJdQr(null);
             setShowJdAuthPanel(false);
             setJdMessage(data.message);
@@ -2297,6 +2300,17 @@ function App() {
                       className="apple-btn-secondary sm"
                       disabled={jdBusy}
                       onClick={() => {
+                        setAuthTab('mobile');
+                        setShowJdAuthPanel(true);
+                      }}
+                    >
+                      {jdSession?.mobileLoginReady ? '重新登录京东手机版' : '登录京东手机版'}
+                    </button>
+                    <button
+                      type="button"
+                      className="apple-btn-secondary sm"
+                      disabled={jdBusy}
+                      onClick={() => {
                         setShowJdAuthPanel(prev => !prev);
                         if (!showJdAuthPanel && authTab === 'qrcode' && !jdQr) {
                           void startJdQrLogin();
@@ -2309,7 +2323,7 @@ function App() {
                           ? '切换京东账号'
                           : '展开京东扫码 / 验证码登录'}
                     </button>
-                    {jdSession?.state === 'logged_in' && (
+                    {(jdSession?.state === 'logged_in' || jdSession?.mobileLoginReady) && (
                       <button
                         type="button"
                         className="apple-btn-danger sm"
@@ -2322,7 +2336,7 @@ function App() {
                   </div>
                 </div>
 
-                {(jdSession?.state !== 'logged_in' || showJdAuthPanel) && (
+                {(showJdAuthPanel || (jdSession?.state !== 'logged_in' && !jdSession?.mobileLoginReady)) && (
                   <div className="apple-auth-group">
                     <div className="apple-segmented">
                       <button
@@ -2348,6 +2362,13 @@ function App() {
                         onClick={() => setAuthTab('remote')}
                       >
                         云端实时画面（过人机验证 / 可视化登录）
+                      </button>
+                      <button
+                        type="button"
+                        className={authTab === 'mobile' ? 'active' : ''}
+                        onClick={() => setAuthTab('mobile')}
+                      >
+                        京东手机版
                       </button>
                     </div>
 
@@ -2454,8 +2475,10 @@ function App() {
                       </form>
                     ) : (
                       <RemoteBrowserViewport
+                        key={authTab}
                         platform="jd"
-                        initialFrame={jdRemoteFrame}
+                        jdMobile={authTab === 'mobile'}
+                        initialFrame={authTab === 'mobile' ? null : jdRemoteFrame}
                         onMessage={msg => setJdMessage(msg)}
                         onLoggedIn={session => {
                           setJdSession(session);
