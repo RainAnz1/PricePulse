@@ -319,6 +319,11 @@ function decodeCookieValue(raw?: string): string {
   }
 }
 
+function usableJdNickname(value?: string): string {
+  const nickname = value?.trim() || '';
+  return nickname.includes('\uFFFD') || nickname === '京东用户' ? '' : nickname;
+}
+
 export function loadPersistedJdSession(): PersistedJdSession | null {
   const filePath = getJdSessionFilePath();
   if (!existsSync(filePath)) return null;
@@ -327,6 +332,9 @@ export function loadPersistedJdSession(): PersistedJdSession | null {
     const parsed = JSON.parse(content) as PersistedJdSession;
     if (!parsed || !parsed.cookies || Object.keys(parsed.cookies).length === 0) {
       return null;
+    }
+    if (!usableJdNickname(parsed.nickname)) {
+      parsed.nickname = usableJdNickname(decodeCookieValue(parsed.cookies.unick)) || usableJdNickname(parsed.pin) || '京东用户';
     }
     return parsed;
   } catch {
@@ -351,9 +359,9 @@ export function savePersistedJdSession(
     existing?.pin ||
     '';
   const rawNickname =
-    (incoming.nickname && incoming.nickname !== '京东用户' ? incoming.nickname : '') ||
-    decodeCookieValue(mergedCookies.unick) ||
-    (existing?.nickname && existing.nickname !== '京东用户' ? existing.nickname : '') ||
+    usableJdNickname(incoming.nickname) ||
+    usableJdNickname(decodeCookieValue(mergedCookies.unick)) ||
+    usableJdNickname(existing?.nickname) ||
     rawPin ||
     '京东用户';
   const pin = rawPin || rawNickname;
@@ -415,7 +423,11 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
         : [res.headers.get('set-cookie') || ''].filter(Boolean);
     Object.assign(refreshedCookies, parseSetCookieHeaders(setCookies));
 
-    const text = await res.text();
+    // Response.text() decodes UTF-8 even when the login service declares GBK.
+    const charset = res.headers.get('content-type')?.match(/\bcharset\s*=\s*["']?([\w-]+)/i)?.[1] || '';
+    const text = /^(gbk|gb2312|gb18030)$/i.test(charset)
+      ? new TextDecoder(charset).decode(await res.arrayBuffer())
+      : await res.text();
     const parsed = parseJsonpPayload<{
       Identity?: { IsAuthenticated?: boolean; Unick?: string; Name?: string };
     }>(text);
@@ -424,7 +436,7 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
     if (identity?.IsAuthenticated === true) {
       authenticated = true;
       pin = identity.Name || '';
-      nickname = identity.Unick || identity.Name || '';
+      nickname = usableJdNickname(identity.Unick);
     }
   } catch {
     // ignore network error
@@ -466,7 +478,7 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
         if (baseInfo?.curPin || baseInfo?.nickname) {
           authenticated = true;
           if (baseInfo.curPin && !pin) pin = baseInfo.curPin;
-          if (baseInfo.nickname) nickname = baseInfo.nickname;
+          nickname = usableJdNickname(baseInfo.nickname) || nickname;
         }
       }
     } catch {
@@ -474,7 +486,7 @@ export async function verifyJdCookiesWithLoginService(cookieHeader: string): Pro
     }
   }
 
-  return { authenticated, rejected: rejected && !authenticated, pin, nickname, refreshedCookies };
+  return { authenticated, rejected: rejected && !authenticated, pin, nickname: nickname || usableJdNickname(pin), refreshedCookies };
 }
 
 function isChromiumProfileLocked(error: unknown): boolean {

@@ -13,6 +13,7 @@ const { RemoteBrowserControls } = require('./dist/remote-browser-controls');
 const sessionModule = require('./dist/sessions');
 const {
   SessionsController,
+  getJdSessionFilePath,
   loadPersistedJdSession,
   runJdSessionKeepAlive,
   savePersistedJdSession,
@@ -248,6 +249,39 @@ test('JD mobile login saves credentials only after returning to JD with both sco
   const status = await controller.getJdStatus();
   assert.equal(status.mobileLoginReady, true);
   assert.equal(loadPersistedJdSession().authExpiredAt, undefined);
+});
+
+test('JD status decodes GBK nicknames and repairs a previously saved garbled account', async t => {
+  const previousRoot = process.env.LOCALAPPDATA;
+  const root = mkdtempSync(join(tmpdir(), 'pricepulse-nickname-'));
+  process.env.LOCALAPPDATA = root;
+  t.after(() => {
+    if (previousRoot === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousRoot;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const cookies = { thor: 'fixture-auth', pt_key: 'fixture-mobile-auth', pt_pin: 'fixture-user' };
+  const legacy = savePersistedJdSession({ cookies, pin: 'fixture-user' });
+  writeFileSync(getJdSessionFilePath(), JSON.stringify({ ...legacy, nickname: '��-fixture' }));
+  assert.equal(loadPersistedJdSession().nickname, 'fixture-user');
+  const gbkNickname = Buffer.from('d6d0cec4eac7b3c6', 'hex'); // 中文昵称
+  t.mock.method(globalThis, 'fetch', async input => {
+    assert.equal(new URL(input).hostname, 'passport.jd.com');
+    return new Response(Buffer.concat([
+      Buffer.from('jsonpLogin({"Identity":{"IsAuthenticated":true,"Name":"fixture-user","Unick":"'),
+      gbkNickname,
+      Buffer.from('"}});'),
+    ]), { headers: { 'Content-Type': 'text/json; charset="GBK"' } });
+  });
+
+  const response = await new SessionsController().getJdStatus();
+  assert.equal(response.state, 'logged_in');
+  assert.equal(response.mobileLoginReady, true);
+  assert.equal(response.nickname, '中文昵称');
+  assert.match(response.message, /中文昵称/);
+  assert.equal(loadPersistedJdSession().nickname, '中文昵称');
+  assert.deepEqual(loadPersistedJdSession().cookies, cookies);
 });
 
 test('temporary JD failures preserve the session and confirmed expiry sends one notification', async t => {
