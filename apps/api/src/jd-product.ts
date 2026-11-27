@@ -12,6 +12,7 @@ interface JdMobileItemInfo {
   product?: {
     skuId?: string;
     skuName?: string;
+    brandName?: string;
     imageurl?: string;
     spec?: string;
     color?: string;
@@ -69,6 +70,7 @@ interface JdRichDetail {
   title?: string;
   shopName?: string;
   spec?: string;
+  mobileItem?: Pick<JdMobileItemInfo, 'product' | 'stock' | 'shareInfo'>;
   htmlText: string;
 }
 
@@ -80,6 +82,10 @@ const jdCollectionMessages = {
   JD_PRICE_UNAVAILABLE: '京东商品页没有返回可识别的价格，请稍后重试。',
 } as const;
 type JdCollectionCode = keyof typeof jdCollectionMessages;
+
+export function isJdVerificationTitle(title: string): boolean {
+  return /^(?:京东\s*[-：:]?\s*)?(?:验证|安全验证|访问验证|人机验证|登录|登录注册|访问受限)(?:\s*[-_｜|]\s*京东)?$/.test(title.trim());
+}
 
 function jdProductPageIssue(url: string): JdCollectionCode | null {
   if (!URL.canParse(url)) return null;
@@ -357,9 +363,10 @@ async function scrapeJdMobileQuote(
       await page.waitForFunction(() => document.fonts.status === 'loaded', undefined, { timeout: 1500 });
       const quote = await page.evaluate(id => {
         const item = (window as Window & { _itemInfo?: JdMobileItemInfo })._itemInfo;
+        const product = item?.product;
         const label = document.querySelector<HTMLElement>('#priceSpec #defaultDesc');
         const value = label?.nextElementSibling as HTMLElement | null | undefined;
-        if (String(item?.product?.skuId) !== id ||
+        if (!product || String(product.skuId) !== id ||
             !label?.checkVisibility({ visibilityProperty: true, opacityProperty: true }) ||
             !value?.checkVisibility({ visibilityProperty: true, opacityProperty: true })) {
           return null;
@@ -409,6 +416,18 @@ async function scrapeJdMobileQuote(
           promotions: [...promotions],
           sellingPrice: item?.priceFloor?.ext?.jdPrice,
           originalPrice: item?.priceFloor?.ext?.realPriceExt?.ORIGINAL?.salePrice,
+          mobileItem: {
+            product: {
+              skuName: product.skuName, imageurl: product.imageurl, brandName: product.brandName,
+              color: product.color, size: product.size, spec: product.spec, category: product.category,
+              cat1: product.cat1, cat2: product.cat2, skuStatus: product.skuStatus,
+            },
+            stock: {
+              StockState: item?.stock?.StockState,
+              D: { shopName: item?.stock?.D?.shopName, vender: item?.stock?.D?.vender },
+            },
+            shareInfo: { title: item?.shareInfo?.title },
+          },
         };
       }, skuId);
       if (!quote || !onProduct()) return null;
@@ -427,6 +446,7 @@ async function scrapeJdMobileQuote(
         subsidyLabel: kind === 'subsidy' ? quote.label : null,
         hasExplicitSubsidyPrice: kind === 'subsidy',
         coupons: quote.promotions,
+        mobileItem: quote.mobileItem,
         htmlText: '',
       };
     } finally {
@@ -454,7 +474,7 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     },
   }).catch(() => null);
 
-  const html = res?.ok ? await res.text().catch(() => '') : '';
+  const html = res?.ok && !jdProductPageIssue(res.url) ? await res.text().catch(() => '') : '';
   let itemInfo: JdMobileItemInfo = {};
   let brandName = '京东商品';
 
@@ -469,6 +489,7 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
         const rawLiteral = html.slice(jsonStart, endIdx);
         // The page embeds a JavaScript object and may leave a trailing comma on the root object.
         itemInfo = JSON.parse(rawLiteral.replace(/,\s*}$/, '}')) as JdMobileItemInfo;
+        if (itemInfo.product?.skuId && String(itemInfo.product.skuId) !== skuId) itemInfo = {};
       } catch {
         // The desktop page can still provide a quote.
       }
@@ -487,33 +508,6 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
       ?.replace(/【图片\s*价格\s*品牌\s*评论】-京东.*$/, '')
       .trim() || '';
 
-  let title =
-    itemInfo.product?.skuName ||
-    itemInfo.shareInfo?.title ||
-    identity.hintTitle ||
-    htmlTitle ||
-    `京东商品 #${skuId}`;
-  const rawImg = itemInfo.product?.imageurl || '';
-  const imageUrl = normalizeImageUrl(rawImg);
-  let shopName = itemInfo.stock?.D?.shopName || itemInfo.stock?.D?.vender || '京东自营 / 官方旗舰店';
-  const specParts = [itemInfo.product?.color, itemInfo.product?.size, itemInfo.product?.spec].filter(Boolean);
-  let spec = specParts.length > 0 ? specParts.join(' · ') : '默认规格';
-  const cat1 = itemInfo.product?.cat1 || '';
-  const cat2 = itemInfo.product?.cat2 || '';
-  const category = itemInfo.product?.category || '';
-
-  const stockState = itemInfo.stock?.StockState ?? 33;
-  const skuStatus = itemInfo.product?.skuStatus ?? '1';
-  const inStock = skuStatus !== '0' && [33, 36, 39, 40].includes(stockState);
-  const stockText =
-    stockState === 33
-      ? '现货'
-      : stockState === 39 || stockState === 40
-        ? '有货'
-        : stockState === 36
-          ? '预定'
-          : '无货 / 下架';
-
   // 优先读取未被字体混淆的 ext.jdPrice / ORIGINAL.salePrice
   const mobileReference =
     parseCleanNumericPrice(itemInfo.priceFloor?.ext?.jdPrice) ||
@@ -525,9 +519,26 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     ? await scrapeJdMobileQuote(skuId, mobileReference, signal) : null;
   const pcResult = mobileQuote ? null : await scrapeJdPcRichDetail(skuId, signal);
   const quote = mobileQuote ?? (typeof pcResult === 'string' ? null : pcResult);
-  if (quote?.title && title.startsWith('京东商品 #')) title = quote.title;
-  if (quote?.shopName && shopName === '京东自营 / 官方旗舰店') shopName = quote.shopName;
-  if (quote?.spec && spec === '默认规格') spec = quote.spec;
+  const mobileItem = mobileQuote?.mobileItem;
+  const product = mobileItem?.product ?? itemInfo.product;
+  const title = [
+    product?.skuName, mobileItem?.shareInfo?.title, itemInfo.product?.skuName,
+    itemInfo.shareInfo?.title, quote?.title, identity.hintTitle, htmlTitle,
+  ].find(name => name?.trim() && !isJdVerificationTitle(name)) || `京东商品 #${skuId}`;
+  const imageUrl = normalizeImageUrl(product?.imageurl || itemInfo.product?.imageurl || '');
+  const shopName = mobileItem?.stock?.D?.shopName || mobileItem?.stock?.D?.vender ||
+    itemInfo.stock?.D?.shopName || itemInfo.stock?.D?.vender || quote?.shopName || '京东自营 / 官方旗舰店';
+  const specParts = [product?.color, product?.size, product?.spec].filter(Boolean);
+  const spec = specParts.join(' · ') || quote?.spec || '默认规格';
+  const cat1 = product?.cat1 || '';
+  const cat2 = product?.cat2 || '';
+  const category = product?.category || '';
+  const stockState = mobileItem?.stock?.StockState ?? itemInfo.stock?.StockState ?? 33;
+  const inStock = product?.skuStatus !== '0' && [33, 36, 39, 40].includes(stockState);
+  const stockText =
+    stockState === 33 ? '现货' :
+    stockState === 39 || stockState === 40 ? '有货' :
+    stockState === 36 ? '预定' : '无货 / 下架';
 
   const pagePrice = quote?.pagePrice || mobilePrice;
   if (!pagePrice || pagePrice <= 0) {
@@ -573,7 +584,7 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     title,
     imageUrl,
     shopName,
-    brandName,
+    brandName: product?.brandName || brandName,
     spec,
     category,
     inStock,

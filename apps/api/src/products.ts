@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join } from 'node:path';
 import { Request } from 'express';
 import { notifyDelistToFeishu, notifyPriceDropToFeishu } from './feishu';
-import { scrapeJdProduct } from './jd-product';
+import { isJdVerificationTitle, scrapeJdProduct } from './jd-product';
 import { productLogger } from './product-collection';
 import type { CollectedProduct } from './product-collection';
 import { ProductIdentity, resolveAndParseProductUrl } from './product-url';
@@ -264,6 +264,7 @@ async function scrapeAndSaveProduct(
   const products = loadMonitoredProducts();
   const existingIdx = products.findIndex(p => p.key === key);
   const existing = existingIdx >= 0 ? products[existingIdx] : null;
+  const existingJd = identity.platform === 'jd' ? existing : null;
 
   const nowIso = new Date().toISOString();
   const newPoint: PriceHistoryPoint = {
@@ -296,12 +297,13 @@ async function scrapeAndSaveProduct(
     id: identity.id,
     skuId: identity.skuId,
     canonicalUrl: identity.canonicalUrl,
-    title: scraped.title,
-    imageUrl: scraped.imageUrl,
-    shopName: scraped.shopName,
-    brandName: scraped.brandName,
-    spec: scraped.spec,
-    category: scraped.category,
+    title: existingJd && scraped.title.startsWith('京东商品 #') && !isJdVerificationTitle(existingJd.title)
+      ? existingJd.title : scraped.title,
+    imageUrl: scraped.imageUrl || existingJd?.imageUrl || '',
+    shopName: scraped.shopName === '京东自营 / 官方旗舰店' ? existingJd?.shopName || scraped.shopName : scraped.shopName,
+    brandName: scraped.brandName === '京东商品' ? existingJd?.brandName || scraped.brandName : scraped.brandName,
+    spec: scraped.spec === '默认规格' ? existingJd?.spec || scraped.spec : scraped.spec,
+    category: scraped.category || existingJd?.category || '',
     inStock: scraped.inStock,
     stockText: scraped.stockText,
     pagePrice: scraped.pagePrice,

@@ -135,8 +135,9 @@ test('a collected low survives the chart window and later alerts compare actual 
     return { ok: true };
   });
   t.mock.method(globalThis, 'fetch', async () => new Response(
-    `window._itemInfo = (${JSON.stringify({
-      product: { skuName: '京东测试商品' }, priceFloor: { ext: { jdPrice: String(collectedPrice) } },
+    `<title>京东验证</title>window._itemInfo = (${JSON.stringify({
+      product: desktopQuoteAvailable ? { skuName: '京东测试商品', color: '云墨黑', imageurl: 'jfs/test.jpg' } : undefined,
+      priceFloor: { ext: { jdPrice: String(collectedPrice) } },
     })});`,
   ));
 
@@ -154,6 +155,9 @@ test('a collected low survives the chart window and later alerts compare actual 
   const { product: baseOnly } = await scrapeAndUpsertProduct(url);
   assert.equal(baseOnly.pagePrice, 155);
   assert.equal(baseOnly.finalPrice, null);
+  assert.equal(baseOnly.title, '京东测试商品');
+  assert.equal(baseOnly.spec, '云墨黑');
+  assert.match(baseOnly.imageUrl, /jfs\/test.jpg$/);
   assert.equal(baseOnly.allTimeLow, 99);
   assert.equal(alerts.length, 1);
 
@@ -495,12 +499,11 @@ test('JD uses the observed mobile quote when the page object has a trailing comm
   assert.equal(page.close.mock.callCount(), 1);
 });
 
-test('JD accepts a labeled mobile quote and leaves masked or unavailable prices pending', async t => {
+test('JD recovers the mobile quote and details when the raw request shows verification', async t => {
   const url = 'https://item.m.jd.com/product/12345678.html';
   const visited = [];
   const scrolls = [];
   let mobilePriceText = '¥2,898.00';
-  let rawPagePrice = '{"price":"2,898.00"}';
   t.mock.method(sessionModule, 'loadPersistedJdSession', () => ({
     cookies: { pt_key: 'fixture-key', pt_pin: 'fixture-pin' },
   }));
@@ -533,6 +536,10 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
             clip: { x: 40, y: 55, width: 84, height: 34 },
             promotions: ['满3000元减200元', '单品满1件减100元'],
             sellingPrice: '3698.00',
+            mobileItem: {
+              product: { skuName: '一加测试商品', imageurl: 'jfs/phone.jpg', brandName: '一加', color: '云墨黑', size: '16GB+512GB' },
+              stock: { D: { shopName: '一加测试旗舰店' }, StockState: 33 },
+            },
           };
         },
         async close() {},
@@ -540,11 +547,18 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
     },
   }));
   t.mock.method(globalThis, 'fetch', async () => new Response(
-    `window._itemInfo = ({"product":{"skuName":"测试商品"},"priceFloor":${rawPagePrice}});`,
+    mobilePriceText.startsWith('¥?')
+      ? 'window._itemInfo = ({"priceFloor":{"ext":{"jdPrice":"3698"}}});'
+      : '<title>京东验证</title>',
   ));
   const identity = { id: '12345678', skuId: '12345678', platform: 'jd', canonicalUrl: url };
   const quote = await scrapeJdProduct(identity, new AbortController().signal);
   assert.equal(quote.pagePrice, 3698);
+  assert.equal(quote.title, '一加测试商品');
+  assert.equal(quote.spec, '云墨黑 · 16GB+512GB');
+  assert.equal(quote.shopName, '一加测试旗舰店');
+  assert.equal(quote.brandName, '一加');
+  assert.match(quote.imageUrl, /jfs\/phone.jpg$/);
   assert.equal(quote.finalPrice, 2898);
   assert.equal(quote.subsidyLabel, '国补领后价');
   assert.equal(quote.subsidyPrice, 2898);
@@ -555,7 +569,6 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
   assert.deepEqual(visited, [url]);
   assert.deepEqual(scrolls, [{ block: 'center', inline: 'nearest', behavior: 'instant' }]);
 
-  rawPagePrice = '{"ext":{"jdPrice":"3698"}}';
   mobilePriceText = '¥????.??';
   const pending = await scrapeJdProduct(identity, new AbortController().signal);
   assert.equal(pending.pagePrice, 3698);
