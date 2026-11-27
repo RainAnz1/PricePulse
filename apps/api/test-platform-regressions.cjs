@@ -7,6 +7,7 @@ const { test } = require('node:test');
 const { readJdDisplayedPrice, resolveJdPrice } = require('./dist/jd-price');
 const { saveFeishuConfig } = require('./dist/feishu');
 const { ProductsController, scrapeAndUpsertProduct } = require('./dist/products');
+const { RemoteBrowserControls } = require('./dist/remote-browser-controls');
 const sessionModule = require('./dist/sessions');
 const {
   SessionsController,
@@ -220,6 +221,30 @@ test('Taobao product verification is reported separately from login expiry', asy
   assert.equal(page.close.mock.callCount(), 1);
 });
 
+test('remote controls apply each batched pointer position in order before releasing', async () => {
+  const events = [];
+  const page = {
+    viewportSize: () => ({ width: 100, height: 100 }),
+    mouse: {
+      async move(x, y) { events.push([x, y]); },
+      async down() { events.push('pressed'); },
+      async up() { events.push('released'); },
+    },
+  };
+  const controls = new RemoteBrowserControls();
+  const send = (type, payload) => controls.update(page, () => page, { id: 'fixture', type, ...payload });
+  await send('down', { x: 1, y: 20 });
+  try {
+    await assert.rejects(send('move', { points: [{ x: 8, y: 20 }, null] }), { status: 400 });
+    await assert.rejects(send('move', { points: Array(25).fill({ x: 8, y: 20 }) }), { status: 400 });
+    await send('move', { points: [{ x: 15, y: 21 }, { x: 12, y: 22 }, { x: 150, y: 24 }] });
+    await send('up', { x: 90, y: 25 });
+    assert.deepEqual(events, [[1, 20], 'pressed', [15, 21], [12, 22], [99, 24], [90, 25], 'released']);
+  } finally {
+    await controls.clear();
+  }
+});
+
 test('manual Taobao verification resumes the same page and is available only to its LAN owner', async t => {
   const previousRoot = process.env.LOCALAPPDATA;
   const previousNetwork = process.env.PRICEPULSE_VERIFICATION_LAN_CIDR;
@@ -249,6 +274,7 @@ test('manual Taobao verification resumes the same page and is available only to 
   const crossSite = request('192.168.0.10', 'a'.repeat(32), 'cross-site');
   let verified = false;
   let closed = false;
+  let showFrame;
   const page = Object.assign(new EventEmitter(), {
     url: () => item,
     title: async () => verified ? '测试商品' : 'CAPTCHA Verification',
@@ -258,6 +284,13 @@ test('manual Taobao verification resumes the same page and is available only to 
     async waitForTimeout() {},
     viewportSize: () => ({ width: 1280, height: 800 }),
     screenshot: async () => Buffer.from('fixture'),
+    screencast: {
+      start: t.mock.fn(async ({ onFrame }) => {
+        showFrame = data => onFrame({ data: Buffer.from(data) });
+        showFrame('first');
+      }),
+      stop: t.mock.fn(async () => {}),
+    },
     evaluate: async task => {
       if (String(task).includes('priceReady')) {
         return { title: verified ? '测试商品' : 'CAPTCHA Verification', priceReady: verified };
@@ -276,7 +309,14 @@ test('manual Taobao verification resumes the same page and is available only to 
   const controller = new ProductsController();
   await assert.rejects(controller.parse(item, owner), error => error.getResponse().verificationAvailable === true);
   assert.equal(page.close.mock.callCount(), 0);
-  assert.match((await controller.getVerificationFrame(owner)).screenshot, /^data:image\/jpeg;base64,/);
+  const frame = await controller.getVerificationFrame(owner);
+  assert.match(frame.screenshot, /^data:image\/jpeg;base64,/);
+  assert.equal(frame.frameId, 1);
+  showFrame('first');
+  assert.deepEqual(await controller.getVerificationFrame(owner, '1'), { state: 'unchanged' });
+  showFrame('next');
+  assert.equal((await controller.getVerificationFrame(owner, '1')).frameId, 2);
+  assert.equal(page.screencast.start.mock.callCount(), 1);
   await assert.rejects(controller.getVerificationFrame(otherBrowser), { status: 410 });
   await assert.rejects(controller.getVerificationFrame(publicProxy), { status: 403 });
   await assert.rejects(controller.getVerificationFrame(crossSite), { status: 403 });
@@ -294,6 +334,7 @@ test('manual Taobao verification resumes the same page and is available only to 
   assert.equal(context.newPage.mock.callCount(), 1);
   assert.equal(page.goto.mock.callCount(), 1);
   assert.equal(page.close.mock.callCount(), 1);
+  assert.equal(page.screencast.stop.mock.callCount(), 1);
   await assert.rejects(controller.getVerificationFrame(owner), { status: 410 });
 
   verified = false;

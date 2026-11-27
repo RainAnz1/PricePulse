@@ -7,7 +7,7 @@ import {
 import type { CollectedProduct } from './product-collection';
 import type { ProductIdentity } from './product-url';
 import { getTaobaoHeadlessContext } from './sessions';
-import { holdTaobaoVerification, isRequestedTaobaoPage, isTaobaoVerificationTitle } from './taobao-verification';
+import { holdTaobaoVerification, isRequestedTaobaoPage, isTaobaoVerificationTitle, stopTaobaoVerificationCapture } from './taobao-verification';
 import type { TaobaoVerification, verificationAccess } from './taobao-verification';
 
 interface ParsedTaobaoDetail {
@@ -228,6 +228,7 @@ export async function scrapeTaobaoProduct(
   let sessionExpired = false;
 
   try {
+    if (resume) await stopTaobaoVerificationCapture(resume);
     const context = resume ? resume.page.context() : await getTaobaoHeadlessContext();
     signal.throwIfAborted();
     const page = resume?.page ?? await context.newPage();

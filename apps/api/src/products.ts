@@ -29,7 +29,7 @@ import { getDataRoot } from './sessions';
 import { scrapeTaobaoProduct } from './taobao-product';
 import type { TaobaoCollectionOptions } from './taobao-product';
 import {
-  checkTaobaoVerificationPage, closeTaobaoVerification, detachTaobaoVerification, isRequestedTaobaoPage,
+  checkTaobaoVerificationPage, closeTaobaoVerification, detachTaobaoVerification, getTaobaoVerificationScreenshot, isRequestedTaobaoPage,
   ownedTaobaoVerification, requireTaobaoVerification, verificationAccess, verificationBrowser,
 } from './taobao-verification';
 
@@ -415,19 +415,20 @@ export class ProductsController implements OnModuleInit {
 
   @Get('verification/frame')
   @Header('Cache-Control', 'no-store')
-  async getVerificationFrame(@Req() req: Request) {
+  async getVerificationFrame(@Req() req: Request, @Query('after') after?: string) {
     const verification = requireTaobaoVerification(req);
     const page = verification.page;
     if (!await checkTaobaoVerificationPage(verification)) return { state: 'ready' };
-    const screenshot = await verificationBrowser.screenshot(page, page);
+    const frame = await getTaobaoVerificationScreenshot(verification, after);
     if (!await checkTaobaoVerificationPage(verification)) return { state: 'ready' };
+    if (!frame) return { state: 'unchanged' };
     const url = new URL(page.url());
     return {
       state: 'verify_required',
       url: url.origin + url.pathname,
-      screenshot,
+      ...frame,
       viewport: page.viewportSize() ?? { width: 1280, height: 800 },
-      message: screenshot ? undefined : '暂时无法显示实时画面',
+      message: frame.screenshot ? undefined : '暂时无法显示实时画面',
     };
   }
 

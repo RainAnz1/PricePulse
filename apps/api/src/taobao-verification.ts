@@ -10,6 +10,12 @@ interface VerificationAccess {
   token: string;
 }
 
+interface VerificationCapture {
+  start: Promise<boolean>;
+  latest?: { id: number; data: Buffer };
+  stop?: Promise<void>;
+}
+
 export interface TaobaoVerification {
   access: VerificationAccess;
   identity: ProductIdentity;
@@ -17,6 +23,7 @@ export interface TaobaoVerification {
   responses: string[];
   stopCapturing: () => void;
   timeout: NodeJS.Timeout;
+  capture?: VerificationCapture;
 }
 
 const tokenHeader = 'x-pricepulse-verification-token';
@@ -94,6 +101,46 @@ export function detachTaobaoVerification(verification: TaobaoVerification) {
   if (current === verification) current = undefined;
   clearTimeout(verification.timeout);
   verification.stopCapturing();
+  void stopTaobaoVerificationCapture(verification);
+}
+
+export function stopTaobaoVerificationCapture(verification: TaobaoVerification): Promise<void> | undefined {
+  const { capture, page } = verification;
+  if (!capture) return;
+  capture.stop ??= capture.start.then(async started => {
+    if (started && !page.isClosed()) await page.screencast.stop().catch(() => {});
+    capture.latest = undefined;
+  });
+  return capture.stop;
+}
+
+export async function getTaobaoVerificationScreenshot(verification: TaobaoVerification, after?: string) {
+  const { page } = verification;
+  if (!verification.capture) {
+    const capture: VerificationCapture = {
+      start: Promise.resolve().then(async () => {
+        await page.screencast.start({
+          quality: 62,
+          size: { width: 1024, height: 640 },
+          onFrame: ({ data }) => {
+            if (capture.stop || capture.latest?.data.equals(data)) return;
+            capture.latest = { id: (capture.latest?.id ?? 0) + 1, data };
+          },
+        });
+        return true;
+      }).catch(() => false),
+    };
+    verification.capture = capture;
+  }
+
+  const { capture } = verification;
+  await capture.start;
+  const frame = capture.latest;
+  if (frame && !capture.stop) {
+    if (String(frame.id) === after) return null;
+    return { frameId: frame.id, screenshot: `data:image/jpeg;base64,${frame.data.toString('base64')}` };
+  }
+  return { screenshot: await verificationBrowser.screenshot(page, page) };
 }
 
 export async function closeTaobaoVerification(verification: TaobaoVerification) {

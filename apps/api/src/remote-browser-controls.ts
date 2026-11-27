@@ -1,7 +1,17 @@
 import { BadRequestException } from '@nestjs/common';
 import type { CDPSession, Page } from 'playwright';
 
-export type RemotePointerInput = { id?: string; type?: 'down' | 'move' | 'up' | 'cancel'; x?: number; y?: number };
+interface PointerPosition { x: number; y: number }
+
+export type RemotePointerInput = Partial<PointerPosition> & {
+  id?: string;
+  type?: 'down' | 'move' | 'up' | 'cancel';
+  points?: PointerPosition[];
+};
+
+function isPointerPosition(value: Partial<PointerPosition> | null): value is PointerPosition {
+  return Number.isFinite(value?.x) && Number.isFinite(value?.y);
+}
 
 interface RemotePointer {
   id: string;
@@ -87,8 +97,8 @@ export class RemoteBrowserControls<Key> {
       return { ok: true };
     }
 
-    const { x, y } = body;
-    if (typeof x !== 'number' || !Number.isFinite(x) || typeof y !== 'number' || !Number.isFinite(y)) {
+    const positions = type === 'move' && body.points !== undefined ? body.points : [body];
+    if (!Array.isArray(positions) || positions.length === 0 || positions.length > 24 || !positions.every(isPointerPosition)) {
       throw new BadRequestException('鼠标坐标无效');
     }
 
@@ -118,7 +128,9 @@ export class RemoteBrowserControls<Key> {
       const width = page.viewportSize()?.width ?? 1280;
       const height = page.viewportSize()?.height ?? 800;
       pointer.action = (pointer.action ?? Promise.resolve()).then(async () => {
-        await page.mouse.move(Math.max(0, Math.min(width - 1, x)), Math.max(0, Math.min(height - 1, y)));
+        for (const { x, y } of positions) {
+          await page.mouse.move(Math.max(0, Math.min(width - 1, x)), Math.max(0, Math.min(height - 1, y)));
+        }
         if (type === 'down') await page.mouse.down();
       });
       await pointer.action;

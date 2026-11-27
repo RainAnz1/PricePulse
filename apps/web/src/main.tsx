@@ -78,6 +78,7 @@ interface JdQrCodeState {
 
 interface RemoteBrowserFrame {
   state: string;
+  frameId?: number;
   url?: string;
   title?: string;
   screenshot?: string;
@@ -699,6 +700,8 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
 }
 
 type RemotePoint = { x: number; y: number };
+type RemotePointerEnd = ({ type: 'up' } & RemotePoint) | { type: 'cancel' };
+type RemotePointerEvent = RemotePointerEnd | ({ type: 'down' } & RemotePoint) | { type: 'move'; points: RemotePoint[] };
 
 const verificationBase = '/api/products/verification';
 
@@ -716,8 +719,8 @@ interface RemotePointerInteraction {
   start: RemotePoint;
   started: boolean;
   sending: boolean;
-  nextMove?: RemotePoint;
-  end?: { type: 'up' | 'cancel'; point?: RemotePoint };
+  moves: RemotePoint[];
+  end?: RemotePointerEnd;
 }
 
 function RemoteBrowserViewport({
@@ -738,8 +741,10 @@ function RemoteBrowserViewport({
   const [frameError, setFrameError] = useState(initialFrame?.screenshot ? undefined : initialFrame?.message);
   const [textInput, setTextInput] = useState('');
   const pointerRef = useRef<RemotePointerInteraction | null>(null);
+  const lastPointerEndRef = useRef(0);
   const actionBusyRef = useRef(false);
   const frameBusyRef = useRef(false);
+  const frameIdRef = useRef<number | undefined>(undefined);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const base = verificationToken ? verificationBase : `/api/sessions/${platform}/remote`;
 
@@ -784,6 +789,7 @@ function RemoteBrowserViewport({
         return;
       }
       setFrame(data);
+      frameIdRef.current = data.frameId;
       setFrameError(data.screenshot ? undefined : data.message);
       if (data.message) onMessage(data.message);
     } catch (error) {
@@ -803,16 +809,20 @@ function RemoteBrowserViewport({
     let lastPoll = 0;
     const controller = new AbortController();
     const timer = window.setInterval(async () => {
-      const interval = pointerRef.current ? 140 : 1350;
-      if (actionBusyRef.current || frameBusyRef.current || Date.now() - lastPoll < interval) return;
-      lastPoll = Date.now();
+      const now = Date.now();
+      const interacting = pointerRef.current || now - lastPointerEndRef.current < 500;
+      const interval = verificationToken ? (interacting ? 40 : 850) : (interacting ? 140 : 1350);
+      if (actionBusyRef.current || frameBusyRef.current || now - lastPoll < interval) return;
+      lastPoll = now;
       frameBusyRef.current = true;
       try {
-        const res = await fetch(`${base}/frame`, {
+        const after = frameIdRef.current === undefined ? '' : `?after=${frameIdRef.current}`;
+        const res = await fetch(`${base}/frame${after}`, {
           headers: verificationToken ? verificationHeaders(verificationToken) : undefined,
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(12000)]),
         });
         const data = await readFrame(res);
+        if (data.state === 'unchanged') return;
         if (data.state === 'ready' && !controller.signal.aborted) {
           setFrame(null);
           setFrameError('已返回商品页，请点击「确定」继续采集');
@@ -824,7 +834,10 @@ function RemoteBrowserViewport({
         }
         if (!actionBusyRef.current && !controller.signal.aborted) {
           setFrameError(data.screenshot ? undefined : data.message);
-          if (data.screenshot) setFrame(data);
+          if (data.screenshot) {
+            frameIdRef.current = data.frameId;
+            setFrame(data);
+          }
         }
       } catch (error) {
         // Retain the last frame while the connection recovers.
@@ -834,7 +847,7 @@ function RemoteBrowserViewport({
       } finally {
         frameBusyRef.current = false;
       }
-    }, 140);
+    }, verificationToken ? 50 : 140);
     return () => {
       controller.abort();
       window.clearInterval(timer);
@@ -883,15 +896,15 @@ function RemoteBrowserViewport({
     };
   }
 
-  async function sendPointer(id: string, type: 'down' | 'move' | 'up' | 'cancel', point?: RemotePoint) {
+  async function sendPointer(id: string, event: RemotePointerEvent) {
     const response = await fetch(`${base}/pointer`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...(verificationToken ? verificationHeaders(verificationToken) : {}),
       },
-      body: JSON.stringify({ id, type, ...point }),
-      keepalive: type === 'cancel' || type === 'up',
+      body: JSON.stringify({ id, ...event }),
+      keepalive: event.type === 'cancel' || event.type === 'up',
       signal: AbortSignal.timeout(5000),
     });
     if (!response.ok) {
@@ -905,21 +918,20 @@ function RemoteBrowserViewport({
     pointer.sending = true;
     try {
       if (!pointer.started) {
-        await sendPointer(pointer.id, 'down', pointer.start);
+        await sendPointer(pointer.id, { type: 'down', ...pointer.start });
         pointer.started = true;
       }
-      while (!pointer.end && pointer.nextMove) {
-        const point = pointer.nextMove;
-        pointer.nextMove = undefined;
-        await sendPointer(pointer.id, 'move', point);
+      while (pointer.end?.type !== 'cancel' && pointer.moves.length > 0) {
+        await sendPointer(pointer.id, { type: 'move', points: pointer.moves.splice(0, 24) });
       }
       if (pointer.end) {
-        await sendPointer(pointer.id, pointer.end.type, pointer.end.point);
+        await sendPointer(pointer.id, pointer.end);
+        lastPointerEndRef.current = Date.now();
         if (pointerRef.current === pointer) pointerRef.current = null;
       }
     } catch (error) {
       if (pointerRef.current === pointer) pointerRef.current = null;
-      void sendPointer(pointer.id, 'cancel').catch(() => {});
+      void sendPointer(pointer.id, { type: 'cancel' }).catch(() => {});
       onMessage(error instanceof Error ? error.message : '鼠标操作中断，请重试');
     } finally {
       pointer.sending = false;
@@ -937,6 +949,7 @@ function RemoteBrowserViewport({
       start: clientToVirtual(e.clientX, e.clientY),
       started: false,
       sending: false,
+      moves: [],
     };
     pointerRef.current = pointer;
     void flushPointer(pointer);
@@ -945,14 +958,21 @@ function RemoteBrowserViewport({
   function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
     const pointer = pointerRef.current;
     if (!pointer || pointer.browserPointerId !== e.pointerId || pointer.end) return;
-    pointer.nextMove = clientToVirtual(e.clientX, e.clientY);
+    const samples = e.nativeEvent.getCoalescedEvents?.();
+    for (const sample of samples?.length ? samples : [e]) {
+      pointer.moves.push(clientToVirtual(sample.clientX, sample.clientY));
+    }
+    if (pointer.moves.length > 256) {
+      pointer.end = { type: 'cancel' };
+      onMessage('远程操作延迟过高，本次拖动已中止，请重试');
+    }
     void flushPointer(pointer);
   }
 
   function finishPointer(e: React.PointerEvent<HTMLDivElement>, type: 'up' | 'cancel') {
     const pointer = pointerRef.current;
     if (!pointer || pointer.browserPointerId !== e.pointerId || pointer.end) return;
-    pointer.end = { type, point: type === 'up' ? clientToVirtual(e.clientX, e.clientY) : undefined };
+    pointer.end = type === 'up' ? { type, ...clientToVirtual(e.clientX, e.clientY) } : { type };
     void flushPointer(pointer);
   }
 
