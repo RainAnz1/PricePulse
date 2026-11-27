@@ -13,7 +13,7 @@ export interface CollectedProduct {
   pagePrice: number;
   couponPrice: number | null;
   subsidyPrice: number | null;
-  finalPrice: number;
+  finalPrice: number | null;
   coupons: string[];
   couponDiscount: number;
   hasSubsidy: boolean;
@@ -36,9 +36,9 @@ export function parseCleanNumericPrice(raw?: string | number | null): number {
   if (!raw || typeof raw !== 'string') return 0;
   // 含有 ? 或字体混淆私用区字符 (U+E000..U+F8FF) 时视为掩码，绝不伪造数字
   if (raw.includes('?') || /[\uE000-\uF8FF]/.test(raw)) return 0;
-  const match = raw.trim().match(/(\d+(?:\.\d{1,2})?)/);
+  const match = raw.trim().match(/(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)/);
   if (!match?.[1]) return 0;
-  const val = Number(match[1]);
+  const val = Number(match[1].replace(/,/g, ''));
   return Number.isFinite(val) && val > 0 ? Number(val.toFixed(2)) : 0;
 }
 
@@ -133,8 +133,21 @@ export function evaluateCouponsAndSubsidy(params: {
     }
   }
 
+  if (useObservedPriceOnly && hasExplicitSubsidyPrice && observedFinalPrice > 0) {
+    return {
+      coupons,
+      couponDiscount: 0,
+      couponPrice: null,
+      hasSubsidy: true,
+      subsidyLabel: observedSubsidyLabel || '国补领后价',
+      subsidyDiscount: explicitSubsidyAmount,
+      subsidyPrice: observedFinalPrice,
+      finalPrice: observedFinalPrice,
+    };
+  }
+
   // 情况 A：页面明确采集到了真实国补价/到手价 + 国补立减金额（例如：日常价 ¥904，京东价 ¥844，国补减 ¥126.6，国补领后价 ¥717.4）
-  if (observedFinalPrice > 0 && explicitSubsidyAmount > 0 && (!useObservedPriceOnly || hasExplicitSubsidyPrice)) {
+  if (observedFinalPrice > 0 && explicitSubsidyAmount > 0 && !useObservedPriceOnly) {
     const preSubsidyPrice = Number((observedFinalPrice + explicitSubsidyAmount).toFixed(2));
     if (pagePrice > preSubsidyPrice + 0.05) {
       couponDiscount = Number((pagePrice - preSubsidyPrice).toFixed(2));

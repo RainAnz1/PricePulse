@@ -38,7 +38,7 @@ export interface PriceHistoryPoint {
   pagePrice: number;
   couponPrice: number | null;
   subsidyPrice: number | null;
-  finalPrice: number;
+  finalPrice: number | null;
   inStock: boolean;
   note?: string;
 }
@@ -56,7 +56,7 @@ export interface MonitoredProduct extends CollectedProduct {
   initialPrice: number | null;
   previousFinalPrice: number | null;
   lastDropAmount: number;
-  historySource: 'fetched_or_realtime' | 'realtime';
+  historySource: 'fetched_or_realtime' | 'realtime' | 'observed';
   priceHistory: PriceHistoryPoint[];
   createdAt: string;
   updatedAt: string;
@@ -86,34 +86,45 @@ const simulatedPriceNotes = new Set(['历史参考价', '近期日常价', '每�
 function normalizePriceHistory(product: MonitoredProduct): MonitoredProduct {
   const oldHistory = Array.isArray(product.priceHistory) ? product.priceHistory : [];
   const priceHistory = oldHistory.filter(point =>
-    Number.isFinite(point?.finalPrice) && point.finalPrice > 0 &&
+    point && (point.finalPrice === null || (Number.isFinite(point.finalPrice) && point.finalPrice > 0)) &&
     Number.isFinite(point.pagePrice) && point.pagePrice > 0 &&
     Number.isFinite(Date.parse(point.timestamp)) &&
     !simulatedPriceNotes.has(point.note ?? '') && !/^降价触发 \(-¥\d+\)$/.test(point.note ?? ''),
-  );
-  if (product.historySource === 'realtime' && priceHistory.length === product.priceHistory?.length) return product;
-
-  let lowPoint: PriceHistoryPoint | undefined;
-  let allTimeHigh: number | null = null;
-  for (const point of priceHistory) {
-    if (!lowPoint || point.finalPrice < lowPoint.finalPrice) lowPoint = point;
-    allTimeHigh = Math.max(allTimeHigh ?? 0, point.pagePrice);
+  ).map(point => {
+    // Older JD samples used the page price when no final quote was available.
+    if (product.platform === 'jd' && product.historySource !== 'observed' &&
+        point.finalPrice === point.pagePrice && !point.couponPrice && !point.subsidyPrice) {
+      return { ...point, finalPrice: null };
+    }
+    return point;
+  });
+  const sameHistory = priceHistory.length === oldHistory.length && priceHistory.every((point, i) => point === oldHistory[i]);
+  if (sameHistory && product.historySource === 'observed') return product;
+  if (sameHistory && product.platform !== 'jd' && product.historySource === 'realtime') {
+    return { ...product, historySource: 'observed' };
   }
+
+  const quoted = priceHistory.filter((point): point is PriceHistoryPoint & { finalPrice: number } => point.finalPrice !== null);
+  const lowPoint = quoted.reduce<(typeof quoted)[number] | undefined>(
+    (low, point) => !low || point.finalPrice < low.finalPrice ? point : low,
+    undefined,
+  );
   const latest = priceHistory.at(-1);
-  const previous = priceHistory.at(-2);
+  const previous = quoted.at(latest?.finalPrice == null ? -1 : -2);
   return {
     ...product,
     pagePrice: latest?.pagePrice ?? 0,
     couponPrice: latest?.couponPrice ?? null,
     subsidyPrice: latest?.subsidyPrice ?? null,
-    finalPrice: latest?.finalPrice ?? 0,
+    finalPrice: latest?.finalPrice ?? null,
     allTimeLow: lowPoint?.finalPrice ?? null,
     allTimeLowAt: lowPoint?.timestamp ?? null,
-    allTimeHigh,
-    initialPrice: priceHistory[0]?.finalPrice ?? null,
+    allTimeHigh: priceHistory.length ? Math.max(...priceHistory.map(point => point.pagePrice)) : null,
+    initialPrice: quoted[0]?.finalPrice ?? null,
     previousFinalPrice: previous?.finalPrice ?? null,
-    lastDropAmount: previous && latest ? Math.max(0, Number((previous.finalPrice - latest.finalPrice).toFixed(2))) : 0,
-    historySource: 'realtime',
+    lastDropAmount: previous && latest?.finalPrice != null
+      ? Math.max(0, Number((previous.finalPrice - latest.finalPrice).toFixed(2))) : 0,
+    historySource: 'observed',
     priceHistory,
     updatedAt: latest?.timestamp ?? product.updatedAt,
   };
@@ -266,15 +277,17 @@ async function scrapeAndSaveProduct(
   };
 
   const priceHistory = [...(existing?.priceHistory ?? []), newPoint].slice(-180);
+  const finalPrice = newPoint.finalPrice;
   const previousLow = existing?.allTimeLow ?? null;
-  const allTimeLow = Math.min(previousLow ?? newPoint.finalPrice, newPoint.finalPrice);
+  const isNewLow = finalPrice !== null && (previousLow === null || finalPrice < previousLow);
+  const allTimeLow = isNewLow ? finalPrice : previousLow;
   const allTimeHigh = Math.max(existing?.allTimeHigh ?? 0, newPoint.pagePrice);
-  const allTimeLowAt = previousLow === allTimeLow ? existing?.allTimeLowAt ?? nowIso : nowIso;
-  const previousFinalPrice = existing?.priceHistory.at(-1)?.finalPrice ?? null;
-  const priceDropped = previousFinalPrice !== null && scraped.finalPrice < previousFinalPrice;
+  const allTimeLowAt = isNewLow ? nowIso : existing?.allTimeLowAt ?? null;
+  const previousFinalPrice = existing?.finalPrice ?? existing?.previousFinalPrice ?? null;
+  const priceDropped = finalPrice !== null && previousFinalPrice !== null && finalPrice < previousFinalPrice;
   const lastDropAmount = priceDropped
-    ? Number((previousFinalPrice - scraped.finalPrice).toFixed(2))
-    : existing?.lastDropAmount ?? 0;
+    ? Number((previousFinalPrice - finalPrice).toFixed(2))
+    : finalPrice === null ? 0 : existing?.lastDropAmount ?? 0;
 
   const updatedProduct: MonitoredProduct = {
     key,
@@ -306,7 +319,7 @@ async function scrapeAndSaveProduct(
     initialPrice: existing?.initialPrice ?? newPoint.finalPrice,
     previousFinalPrice,
     lastDropAmount,
-    historySource: 'realtime',
+    historySource: 'observed',
     priceHistory,
     createdAt: existing?.createdAt || nowIso,
     updatedAt: nowIso,
@@ -320,7 +333,7 @@ async function scrapeAndSaveProduct(
   saveMonitoredProducts(products);
 
   let feishuPushed = false;
-  if (priceDropped && previousFinalPrice !== null) {
+  if (priceDropped && finalPrice !== null && allTimeLow !== null) {
     const pushRes = await notifyPriceDropToFeishu({
       platform: updatedProduct.platform,
       productId: updatedProduct.id,
@@ -328,7 +341,7 @@ async function scrapeAndSaveProduct(
       shopName: updatedProduct.shopName,
       url: updatedProduct.canonicalUrl,
       previousPrice: previousFinalPrice,
-      currentFinalPrice: updatedProduct.finalPrice,
+      currentFinalPrice: finalPrice,
       pagePrice: updatedProduct.pagePrice,
       couponPrice: updatedProduct.couponPrice,
       subsidyPrice: updatedProduct.subsidyPrice,
@@ -336,7 +349,7 @@ async function scrapeAndSaveProduct(
       hasSubsidy: updatedProduct.hasSubsidy,
       subsidyLabel: updatedProduct.subsidyLabel,
       allTimeLow,
-      isNewAllTimeLow: previousLow !== null && newPoint.finalPrice < previousLow,
+      isNewAllTimeLow: previousLow !== null && isNewLow,
     });
     feishuPushed = pushRes.ok;
   } else if (previousFinalPrice !== null && existing?.inStock && !updatedProduct.inStock) {
@@ -398,8 +411,8 @@ export class ProductsController implements OnModuleInit {
   }
 
   private formatCollection({ product, isNew, priceDropped, feishuPushed }: ProductScrapeResult) {
-    const subsidyNote = product.hasSubsidy
-      ? ` ｜ 国补后到手 ¥${product.finalPrice.toFixed(2)} (${product.subsidyLabel})`
+    const subsidyNote = product.finalPrice === null ? ' ｜ 暂未采到到手价'
+      : product.hasSubsidy ? ` ｜ 国补后到手 ¥${product.finalPrice.toFixed(2)} (${product.subsidyLabel})`
       : ` ｜ 预估到手 ¥${product.finalPrice.toFixed(2)}`;
     return {
       ...product,
@@ -480,7 +493,9 @@ export class ProductsController implements OnModuleInit {
     const result = await this.collect(target.canonicalUrl, req);
     return {
       ...result,
-      message: `已刷新「${result.product.title.slice(0, 24)}…」最新到手价 ¥${result.product.finalPrice.toFixed(2)}`,
+      message: `已刷新「${result.product.title.slice(0, 24)}…」${result.product.finalPrice === null
+        ? `页面价格 ¥${result.product.pagePrice.toFixed(2)}，暂未采到到手价`
+        : `最新到手价 ¥${result.product.finalPrice.toFixed(2)}`}`,
     };
   }
 

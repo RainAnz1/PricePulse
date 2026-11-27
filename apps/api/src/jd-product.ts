@@ -60,7 +60,7 @@ const MOBILE_UA =
 
 interface JdPcRichDetail {
   pagePrice: number;
-  finalPrice: number;
+  finalPrice: number | null;
   couponPrice: number;
   subsidyDiscount: number;
   subsidyLabel: string | null;
@@ -140,6 +140,7 @@ async function scrapeJdPcRichDetail(
             const txt =
               (document.querySelector('.summary-price-wrap') ||
                 document.querySelector(`.J-p-${id}`) ||
+                document.querySelector('.product-price-panel .product-price--main') ||
                 document.querySelector('.p-price'))?.textContent || '';
             return /\d+(?:\.\d{1,2})?/.test(txt);
           }, skuId)
@@ -151,17 +152,25 @@ async function scrapeJdPcRichDetail(
       if (pageIssue) return pageIssue;
       const domExtracted = await page.evaluate((id: string) => {
         const clean = (s?: string | null) => (s || '').replace(/\s+/g, ' ').trim();
+        const pricePanel = document.querySelector('.product-price-panel');
+        const mainPrice = pricePanel?.querySelector('.product-price--main');
+        const mainPriceTag = mainPrice?.nextElementSibling;
+        const labeledMainPrice = mainPriceTag?.matches('.product-price--activity-item--tag')
+          ? `${clean(mainPrice?.textContent)} ${clean(mainPriceTag.textContent)}` : '';
         const priceWrapEl =
           (document.querySelector('.summary-price-wrap') as HTMLElement | null) ||
           (document.querySelector('.itemInfo-wrap') as HTMLElement | null);
         const priceAreaText = (priceWrapEl?.innerText || '').slice(0, 2500);
-        const quanAreaText = clean(
+        const appliedDiscount = (document.querySelector('.page-right-discount') as HTMLElement | null)?.innerText
+          ?.split('可再享')[0] || '';
+        const quanAreaText = [clean(
           (document.querySelector('#summary-quan, .quan-item, .J-prom-quan') as HTMLElement | null)?.innerText,
-        ).slice(0, 1200);
-        const jpText = clean(document.querySelector(`.J-p-${id}`)?.textContent);
+        ), appliedDiscount].join('\n').slice(0, 1200);
+        const jpText = clean(mainPrice?.textContent) || clean(document.querySelector(`.J-p-${id}`)?.textContent);
         const pPriceText = clean(document.querySelector('.p-price')?.textContent);
         const pageOriginPriceText = clean(
-          document.querySelector('#page_origin_price, .p-price-origin, .summary-price-wrap del')?.textContent,
+          (pricePanel?.querySelector('.product-price--gray') ||
+            document.querySelector('#page_origin_price, .p-price-origin, .summary-price-wrap del'))?.textContent,
         );
         const handPriceElText = clean(
           (priceWrapEl?.querySelector(
@@ -178,6 +187,7 @@ async function scrapeJdPcRichDetail(
 
         return {
           priceAreaText,
+          labeledMainPrice,
           quanAreaText,
           jpText,
           pPriceText,
@@ -262,7 +272,7 @@ async function scrapeJdPcRichDetail(
       }
 
       const text = domExtracted.priceAreaText;
-      const displayed = readJdDisplayedPrice(text);
+      const displayed = readJdDisplayedPrice(`${domExtracted.labeledMainPrice ?? ''}\n${text}`);
       const displayedPrice = displayed.price || parseCleanNumericPrice(domExtracted.handPriceElText);
       if (displayedPrice > 0) {
         hasExplicitSubsidyPrice = displayed.subsidy;
@@ -272,7 +282,8 @@ async function scrapeJdPcRichDetail(
         }
       }
       if (hasExplicitSubsidyPrice) {
-        const discount = text.match(/国家补贴\s*[|｜]?\s*(?:领后减|立减)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/);
+        const discount = `${text}\n${domExtracted.quanAreaText}`
+          .match(/国家补贴\s*[|｜]?\s*(?:领后减|立减)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)/);
         if (discount?.[1]) {
           subsidyDiscount = parseCleanNumericPrice(discount[1]);
           subsidyLabel = `国家补贴 | 领后减 ¥${subsidyDiscount}`;
@@ -285,26 +296,22 @@ async function scrapeJdPcRichDetail(
       if (jpVal > 0 && !jdSellingPrice) jdSellingPrice = jpVal;
       if (domOriginVal > 0) originPrice = Math.max(originPrice, domOriginVal);
 
-      const { finalPrice, pagePrice } = resolveJdPrice({
+      const { pagePrice } = resolveJdPrice({
         displayed: displayedPrice,
         quotedOffer: explicitFinalPrice,
         selling: jdSellingPrice,
         original: originPrice,
       });
 
-      if (finalPrice > 0 && subsidyDiscount > 0) {
-        const preSub = Number((finalPrice + subsidyDiscount).toFixed(2));
-        if (pagePrice > preSub + 0.05) {
-          couponPrice = preSub;
-        }
-      } else if (finalPrice > 0 && pagePrice > finalPrice + 0.05 && !hasExplicitSubsidyPrice) {
+      const finalPrice = displayedPrice || explicitFinalPrice;
+      if (finalPrice > 0 && pagePrice > finalPrice + 0.05 && !hasExplicitSubsidyPrice) {
         couponPrice = finalPrice;
       }
 
       if (pagePrice > 0 || finalPrice > 0) {
         return {
           pagePrice: pagePrice || finalPrice,
-          finalPrice: finalPrice || pagePrice,
+          finalPrice: finalPrice || null,
           couponPrice,
           subsidyDiscount,
           subsidyLabel,
@@ -445,7 +452,7 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     cat2,
     pagePrice,
     htmlText: combinedText,
-    observedFinalPrice: pcRich?.finalPrice || mobilePrice,
+    observedFinalPrice: pcRich?.finalPrice ?? undefined,
     observedCouponPrice: pcRich?.couponPrice,
     observedSubsidyDiscount: pcRich?.subsidyDiscount,
     observedSubsidyLabel: pcRich?.subsidyLabel,
@@ -465,5 +472,6 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     stockText,
     pagePrice,
     ...promo,
+    finalPrice: pcRich?.finalPrice ?? null,
   };
 }

@@ -22,6 +22,7 @@ test('JD uses the displayed offer in either order and preserves a lower referenc
   assert.deepEqual(readJdDisplayedPrice('¥699 到手价 ¥799'), { price: 699, subsidy: false });
   assert.deepEqual(readJdDisplayedPrice('京东价 ¥599\n预估到手价：￥699'), { price: 699, subsidy: false });
   assert.deepEqual(readJdDisplayedPrice('国补领后价 ¥1,279.99'), { price: 1279.99, subsidy: true });
+  assert.deepEqual(readJdDisplayedPrice('¥2,898 国补领后价 ¥3,698 补贴价'), { price: 2898, subsidy: true });
   assert.deepEqual(readJdDisplayedPrice('京东价 ¥699\n满500减50'), { price: 0, subsidy: false });
   assert.deepEqual(resolveJdPrice({ displayed: 699, quotedOffer: 659, selling: 649, original: 799 }), {
     finalPrice: 699, pagePrice: 799,
@@ -57,10 +58,17 @@ test('saved price histories remove legacy simulations and rebuild stats from the
   const dir = join(root, 'PriceDrop', 'data');
   const file = join(dir, 'products.json');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(file, JSON.stringify([legacy, { ...legacy, key: 'jd:123456:123456', priceHistory: mocks }]));
+  writeFileSync(file, JSON.stringify([
+    legacy,
+    { ...legacy, key: 'jd:123456:123456', priceHistory: mocks },
+    {
+      ...legacy, key: 'jd:223456:223456', platform: 'jd', historySource: 'realtime',
+      priceHistory: [points(latest.timestamp, 3698, 3698, '首次添加采集')],
+    },
+  ]));
   const controller = new ProductsController();
 
-  const [product, empty] = controller.list().products;
+  const [product, empty, baseOnly] = controller.list().products;
   assert.equal(product.title, legacy.title);
   assert.deepEqual(product.priceHistory, [first, latest]);
   assert.equal(product.allTimeLow, 99);
@@ -71,6 +79,10 @@ test('saved price histories remove legacy simulations and rebuild stats from the
   assert.equal(empty.allTimeLow, null);
   assert.equal(empty.allTimeHigh, null);
   assert.deepEqual(empty.priceHistory, []);
+  assert.equal(baseOnly.pagePrice, 3698);
+  assert.equal(baseOnly.finalPrice, null);
+  assert.equal(baseOnly.priceHistory[0].finalPrice, null);
+  assert.equal(baseOnly.allTimeLow, null);
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), controller.list().products);
 });
 
@@ -96,13 +108,26 @@ test('a collected low survives the chart window and later alerts compare actual 
   const dir = join(root, 'PriceDrop', 'data');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'products.json'), JSON.stringify([{
-    key: 'jd:12345678:12345678', historySource: 'realtime', priceHistory: history,
+    key: 'jd:12345678:12345678', platform: 'jd', historySource: 'observed', priceHistory: history,
     allTimeLow: 99, allTimeHigh: 260, allTimeLowAt: history[0].timestamp,
     initialPrice: 99, pagePrice: 260, finalPrice: 260, inStock: true,
   }]));
 
-  t.mock.method(sessionModule, 'getJdHeadlessContext', async () => { throw new Error('fixture mobile-only result'); });
   let collectedPrice = 155;
+  let desktopQuoteAvailable = true;
+  t.mock.method(sessionModule, 'getJdHeadlessContext', async () => ({
+    newPage: async () => ({
+      on() {}, async goto() {}, async close() {}, async waitForTimeout() {},
+      url: () => desktopQuoteAvailable ? 'https://item.jd.com/12345678.html' : 'https://pc-frequent-pro.pf.jd.com/',
+      async evaluate(task) {
+        if (!String(task).includes('priceAreaText')) return true;
+        return {
+          priceAreaText: `预估到手价 ¥${collectedPrice}`, quanAreaText: '', jpText: '260',
+          pPriceText: '', pageOriginPriceText: '', handPriceElText: '',
+        };
+      },
+    }),
+  }));
   const alerts = [];
   t.mock.method(require('./dist/feishu'), 'notifyPriceDropToFeishu', async alert => {
     alerts.push(alert);
@@ -124,6 +149,14 @@ test('a collected low survives the chart window and later alerts compare actual 
   assert.equal(alerts[0].previousPrice, 260);
   assert.equal(alerts[0].isNewAllTimeLow, false);
 
+  desktopQuoteAvailable = false;
+  const { product: baseOnly } = await scrapeAndUpsertProduct(url);
+  assert.equal(baseOnly.pagePrice, 155);
+  assert.equal(baseOnly.finalPrice, null);
+  assert.equal(baseOnly.allTimeLow, 99);
+  assert.equal(alerts.length, 1);
+
+  desktopQuoteAvailable = true;
   collectedPrice = 89;
   const { product: cheaper } = await scrapeAndUpsertProduct(url);
   assert.equal(cheaper.allTimeLow, 89);
@@ -391,8 +424,36 @@ test('JD uses the observed mobile quote when the page object has a trailing comm
   const product = await scrapeJdProduct(identity, AbortSignal.timeout(5000));
   assert.equal(product.title, '测试商品');
   assert.equal(product.pagePrice, 159);
-  assert.equal(product.finalPrice, 159);
+  assert.equal(product.finalPrice, null);
   assert.equal(page.close.mock.callCount(), 1);
+});
+
+test('JD keeps the desktop subsidized quote, reference price and applied subsidy distinct', async t => {
+  const identity = { platform: 'jd', id: '12345678', skuId: '12345678', canonicalUrl: 'https://item.jd.com/12345678.html' };
+  t.mock.method(globalThis, 'fetch', async () => new Response(''));
+  t.mock.method(sessionModule, 'getJdHeadlessContext', async () => ({
+    newPage: async () => ({
+      on() {}, async goto() {}, async close() {}, async waitForTimeout() {},
+      url: () => identity.canonicalUrl,
+      async evaluate(task) {
+        if (!String(task).includes('priceAreaText')) return true;
+        return {
+          priceAreaText: '', labeledMainPrice: '¥2,898 国补领后价', jpText: '¥2,898',
+          pageOriginPriceText: '¥3,698补贴价', pPriceText: '', handPriceElText: '',
+          quanAreaText: '已享受：\n国家补贴｜领后减￥500\n满3000减200',
+        };
+      },
+    }),
+  }));
+
+  const product = await scrapeJdProduct(identity, AbortSignal.timeout(5000));
+  assert.equal(product.pagePrice, 3698);
+  assert.equal(product.finalPrice, 2898);
+  assert.equal(product.subsidyPrice, 2898);
+  assert.equal(product.subsidyDiscount, 500);
+  assert.equal(product.couponPrice, null);
+  assert.equal(product.couponDiscount, 0);
+  assert.deepEqual(product.coupons, ['满3000减200']);
 });
 
 test('product collection shares a SKU job and queues one manual request without opening a second browser page', async t => {
