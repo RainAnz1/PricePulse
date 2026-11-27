@@ -136,7 +136,7 @@ test('a collected low survives the chart window and later alerts compare actual 
     return { ok: true };
   });
   t.mock.method(globalThis, 'fetch', async () => new Response(
-    `<title>京东验证</title>window._itemInfo = (${JSON.stringify({
+    `window._itemInfo = (${JSON.stringify({
       product: desktopQuoteAvailable ? { skuName: '京东测试商品', color: '云墨黑', imageurl: 'jfs/test.jpg' } : undefined,
       priceFloor: { ext: { jdPrice: String(collectedPrice) } },
     })});`,
@@ -484,29 +484,40 @@ test('manual Taobao verification resumes the same page and is available only to 
   await assert.rejects(controller.getVerificationFrame(otherBrowser), { status: 410 });
 });
 
-test('JD frequency controls are reported separately from login', async t => {
+test('JD stops after a confirmed frequency restriction and does not try other routes', async t => {
   const limitedResponse = new Response('<html></html>');
   Object.defineProperty(limitedResponse, 'url', { value: 'https://trade.m.jd.com/common/limit.html' });
-  t.mock.method(globalThis, 'fetch', async () => limitedResponse);
+  const request = t.mock.method(globalThis, 'fetch', async () => limitedResponse);
+  let signedIn = false;
+  t.mock.method(sessionModule, 'loadPersistedJdSession', () => signedIn
+    ? { cookies: { pt_key: 'fixture-key', pt_pin: 'fixture-pin' } } : null);
   const page = {
     on() {},
     async route() {},
     async goto() {},
     async waitForTimeout() {},
-    url: () => 'https://pc-frequent-pro.pf.jd.com/',
+    url: () => 'https://trade.m.jd.com/common/limit.html',
     evaluate: t.mock.fn(async () => ({})),
     close: t.mock.fn(async () => {}),
   };
-  t.mock.method(sessionModule, 'getJdHeadlessContext', async () => ({
+  const browser = t.mock.method(sessionModule, 'getJdHeadlessContext', async () => ({
     newPage: async () => page,
   }));
 
-  await assert.rejects(scrapeAndUpsertProduct('https://item.jd.com/12345678.html'), error => {
+  const url = 'https://item.jd.com/12345678.html';
+  const expectLimit = error => {
     assert.equal(error.getResponse().code, 'JD_RATE_LIMITED');
     assert.match(error.message, /访问频率/);
     assert.doesNotMatch(error.message, /重新扫码/);
     return true;
-  });
+  };
+  await assert.rejects(scrapeAndUpsertProduct(url), expectLimit);
+  assert.equal(request.mock.callCount(), 1);
+  assert.equal(browser.mock.callCount(), 0);
+  signedIn = true;
+  await assert.rejects(scrapeAndUpsertProduct(url), expectLimit);
+  assert.equal(request.mock.callCount(), 1);
+  assert.equal(browser.mock.callCount(), 1);
   assert.equal(page.evaluate.mock.callCount(), 0);
   assert.equal(page.close.mock.callCount(), 1);
 });
@@ -533,7 +544,7 @@ test('JD uses the observed mobile quote when the page object has a trailing comm
   assert.equal(page.close.mock.callCount(), 1);
 });
 
-test('JD recovers the mobile quote and details when the raw request shows verification', async t => {
+test('JD collects the signed-in mobile page once and keeps a reference-only item monitorable', async t => {
   const url = 'https://item.m.jd.com/product/12345678.html';
   const visited = [];
   const scrolls = [];
@@ -549,7 +560,7 @@ test('JD recovers the mobile quote and details when the raw request shows verifi
         async goto(href) {
           destination = href;
           visited.push(href);
-          return { ok: () => true };
+          return { ok: () => true, status: () => 200 };
         },
         url: () => destination === url ? url : 'https://pc-frequent-pro.pf.jd.com/',
         locator(selector) {
@@ -565,9 +576,12 @@ test('JD recovers the mobile quote and details when the raw request shows verifi
         async evaluate(_task, skuId) {
           assert.equal(skuId, '12345678');
           return {
-            label: '国补领后价',
-            text: mobilePriceText,
-            clip: { x: 40, y: 55, width: 84, height: 34 },
+            title: '一加测试商品',
+            offer: mobilePriceText === null ? null : {
+              label: '国补领后价',
+              text: mobilePriceText,
+              clip: { x: 40, y: 55, width: 84, height: 34 },
+            },
             promotions: ['满3000元减200元', '单品满1件减100元'],
             sellingPrice: '3698.00',
             mobileItem: {
@@ -580,11 +594,7 @@ test('JD recovers the mobile quote and details when the raw request shows verifi
       };
     },
   }));
-  t.mock.method(globalThis, 'fetch', async () => new Response(
-    mobilePriceText.startsWith('¥?')
-      ? 'window._itemInfo = ({"priceFloor":{"ext":{"jdPrice":"3698"}}});'
-      : '<title>京东验证</title>',
-  ));
+  const request = t.mock.method(globalThis, 'fetch', async () => new Response('<title>京东验证</title>'));
   const identity = { id: '12345678', skuId: '12345678', platform: 'jd', canonicalUrl: url };
   const quote = await scrapeJdProduct(identity, new AbortController().signal);
   assert.equal(quote.pagePrice, 3698);
@@ -608,7 +618,12 @@ test('JD recovers the mobile quote and details when the raw request shows verifi
   assert.equal(pending.pagePrice, 3698);
   assert.equal(pending.finalPrice, null);
   assert.equal(pending.subsidyPrice, null);
-  assert.deepEqual(visited.slice(1), [url, 'https://item.jd.com/12345678.html']);
+  mobilePriceText = null;
+  const referenceOnly = await scrapeJdProduct(identity, new AbortController().signal);
+  assert.equal(referenceOnly.pagePrice, 3698);
+  assert.equal(referenceOnly.finalPrice, null);
+  assert.deepEqual(visited, [url, url, url]);
+  assert.equal(request.mock.callCount(), 0);
 });
 
 test('JD keeps the desktop subsidized quote, reference price and applied subsidy distinct', async t => {

@@ -103,6 +103,11 @@ function jdProductPageIssue(url: string): JdCollectionCode | null {
   return null;
 }
 
+function jdProductResponseIssue(url: string, status?: number): JdCollectionCode | null {
+  return jdProductPageIssue(url) ??
+    (status === 429 ? 'JD_RATE_LIMITED' : status === 403 ? 'JD_PRICE_ACCESS_DENIED' : null);
+}
+
 async function scrapeJdPcRichDetail(
   skuId: string, signal: AbortSignal,
 ): Promise<JdRichDetail | JdCollectionCode | null> {
@@ -132,10 +137,12 @@ async function scrapeJdPcRichDetail(
         }
       });
 
-      await page.goto(`https://item.jd.com/${skuId}.html`, {
+      const response = await page.goto(`https://item.jd.com/${skuId}.html`, {
         waitUntil: 'domcontentloaded',
         timeout: 18000,
       });
+      const responseIssue = jdProductResponseIssue(page.url(), response?.status());
+      if (responseIssue) return responseIssue;
 
       for (let i = 0; i < 14; i++) {
         const issue = jdProductPageIssue(page.url());
@@ -340,8 +347,8 @@ async function scrapeJdPcRichDetail(
 }
 
 async function scrapeJdMobileQuote(
-  skuId: string, referencePrice: number, signal: AbortSignal,
-): Promise<JdRichDetail | null> {
+  skuId: string, signal: AbortSignal,
+): Promise<JdRichDetail | JdCollectionCode | null> {
   try {
     const context = await getJdHeadlessContext();
     signal.throwIfAborted();
@@ -354,49 +361,54 @@ async function scrapeJdMobileQuote(
     };
     try {
       const response = await page.goto(mobileUrl.href, { waitUntil: 'domcontentloaded', timeout: 10500 });
+      const responseIssue = jdProductResponseIssue(page.url(), response?.status());
+      if (responseIssue) return responseIssue;
       if (!response?.ok() || !onProduct()) return null;
       await page.locator('#priceSpec #defaultDesc + span').evaluate(
         value => value.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }),
         undefined,
-        { timeout: 4000 },
-      );
-      await page.waitForFunction(() => document.fonts.status === 'loaded', undefined, { timeout: 1500 });
-      const quote = await page.evaluate(id => {
+        { timeout: 1500 },
+      ).catch(() => {});
+      await page.waitForFunction(() => document.fonts.status === 'loaded', undefined, { timeout: 1500 }).catch(() => {});
+      const detail = await page.evaluate(id => {
         const item = (window as Window & { _itemInfo?: JdMobileItemInfo })._itemInfo;
         const product = item?.product;
-        const label = document.querySelector<HTMLElement>('#priceSpec #defaultDesc');
-        const value = label?.nextElementSibling as HTMLElement | null | undefined;
-        if (!product || String(product.skuId) !== id ||
-            !label?.checkVisibility({ visibilityProperty: true, opacityProperty: true }) ||
-            !value?.checkVisibility({ visibilityProperty: true, opacityProperty: true })) {
-          return null;
-        }
-        const walker = document.createTreeWalker(value, NodeFilter.SHOW_TEXT);
-        let left = Infinity, top = Infinity, right = 0, bottom = 0;
-        for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
-          const start = node.data.search(/[\d\uE000-\uF8FF.,]/);
-          if (start < 0) continue;
-          const range = document.createRange();
-          range.setStart(node, start);
-          range.setEnd(node, node.length);
-          const r = range.getBoundingClientRect();
-          if (!r.width || !r.height) continue;
-          left = Math.min(left, r.left);
-          top = Math.min(top, r.top);
-          right = Math.max(right, r.right);
-          bottom = Math.max(bottom, r.bottom);
-        }
-        if (right <= left || bottom <= top) return null;
-        // The product's floating recommendations can cover a price that is inside the viewport.
-        const centerY = (top + bottom) / 2;
-        if ([0.2, 0.5, 0.8].some(ratio => !value.contains(document.elementFromPoint(left + (right - left) * ratio, centerY)))) {
-          return null;
-        }
-        const x = Math.max(0, Math.floor(left));
-        const y = Math.max(0, Math.floor(top) - 4);
-        const width = Math.min(innerWidth, Math.ceil(right) + 2) - x;
-        const height = Math.min(innerHeight, Math.ceil(bottom) + 4) - y;
-        if (width <= 0 || height <= 0 || width > 350 || height > 95) return null;
+        if (!product || String(product.skuId) !== id) return { title: document.title };
+        const readOffer = () => {
+          const label = document.querySelector<HTMLElement>('#priceSpec #defaultDesc');
+          const value = label?.nextElementSibling as HTMLElement | null | undefined;
+          if (!label?.checkVisibility({ visibilityProperty: true, opacityProperty: true }) ||
+              !value?.checkVisibility({ visibilityProperty: true, opacityProperty: true })) {
+            return null;
+          }
+          const walker = document.createTreeWalker(value, NodeFilter.SHOW_TEXT);
+          let left = Infinity, top = Infinity, right = 0, bottom = 0;
+          for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
+            const start = node.data.search(/[\d\uE000-\uF8FF.,]/);
+            if (start < 0) continue;
+            const range = document.createRange();
+            range.setStart(node, start);
+            range.setEnd(node, node.length);
+            const r = range.getBoundingClientRect();
+            if (!r.width || !r.height) continue;
+            left = Math.min(left, r.left);
+            top = Math.min(top, r.top);
+            right = Math.max(right, r.right);
+            bottom = Math.max(bottom, r.bottom);
+          }
+          if (right <= left || bottom <= top) return null;
+          // Floating recommendations can cover a price that is inside the viewport.
+          const centerY = (top + bottom) / 2;
+          if ([0.2, 0.5, 0.8].some(ratio => !value.contains(document.elementFromPoint(left + (right - left) * ratio, centerY)))) {
+            return null;
+          }
+          const x = Math.max(0, Math.floor(left));
+          const y = Math.max(0, Math.floor(top) - 4);
+          const width = Math.min(innerWidth, Math.ceil(right) + 2) - x;
+          const height = Math.min(innerHeight, Math.ceil(bottom) + 4) - y;
+          if (width <= 0 || height <= 0 || width > 350 || height > 95) return null;
+          return { label: label.innerText.trim(), text: value.innerText.trim(), clip: { x, y, width, height } };
+        };
         const promotions = new Set<string>();
         for (const row of document.querySelectorAll<HTMLElement>('#discountFloor .prom_item')) {
           const category = row.querySelector<HTMLElement>('.de_tag')?.innerText.trim() ?? '';
@@ -410,9 +422,8 @@ async function scrapeJdMobileQuote(
           }
         }
         return {
-          label: label.innerText.trim(),
-          text: value.innerText.trim(),
-          clip: { x, y, width, height },
+          offer: readOffer(),
+          title: document.title,
           promotions: [...promotions],
           sellingPrice: item?.priceFloor?.ext?.jdPrice,
           originalPrice: item?.priceFloor?.ext?.realPriceExt?.ORIGINAL?.salePrice,
@@ -430,23 +441,32 @@ async function scrapeJdMobileQuote(
           },
         };
       }, skuId);
-      if (!quote || !onProduct()) return null;
-      const kind = jdOfferLabelKind(quote.label);
-      const shape = jdVisiblePriceShape(quote.text);
-      const pagePrice = parseCleanNumericPrice(quote.sellingPrice) || parseCleanNumericPrice(quote.originalPrice) || referencePrice;
-      if (!kind || !shape || !pagePrice) return null;
-      const plainPrice = /^(?:[¥￥]\s*)?\d[\d,.]*$/.test(quote.text) ? parseCleanNumericPrice(quote.text) : 0;
-      const price = plainPrice || await readJdPriceImage(await page.screenshot({ clip: quote.clip, timeout: 3000 }), shape, signal);
-      if (!price || price > pagePrice || !onProduct()) return null;
+      if (!onProduct()) return jdProductPageIssue(page.url());
+      if (isJdVerificationTitle(detail.title)) return 'JD_VERIFICATION_REQUIRED';
+      const pagePrice = parseCleanNumericPrice(detail.sellingPrice) || parseCleanNumericPrice(detail.originalPrice);
+      if (!pagePrice) return null;
+      const offer = detail.offer;
+      const kind = offer ? jdOfferLabelKind(offer.label) : null;
+      const shape = offer ? jdVisiblePriceShape(offer.text) : null;
+      let finalPrice: number | null = null;
+      if (offer && kind && shape) {
+        const plainPrice = /^(?:[¥￥]\s*)?\d[\d,.]*$/.test(offer.text) ? parseCleanNumericPrice(offer.text) : 0;
+        const price = plainPrice || await page.screenshot({ clip: offer.clip, timeout: 3000 })
+          .then(image => readJdPriceImage(image, shape, signal))
+          .catch(() => null);
+        if (price && price <= pagePrice) finalPrice = price;
+      }
+      if (!onProduct()) return jdProductPageIssue(page.url());
+      const hasExplicitSubsidyPrice = finalPrice !== null && kind === 'subsidy';
       return {
         pagePrice,
-        finalPrice: price,
+        finalPrice,
         couponPrice: 0,
         subsidyDiscount: 0,
-        subsidyLabel: kind === 'subsidy' ? quote.label : null,
-        hasExplicitSubsidyPrice: kind === 'subsidy',
-        coupons: quote.promotions,
-        mobileItem: quote.mobileItem,
+        subsidyLabel: hasExplicitSubsidyPrice ? offer?.label ?? null : null,
+        hasExplicitSubsidyPrice,
+        coupons: detail.promotions ?? [],
+        mobileItem: detail.mobileItem,
         htmlText: '',
       };
     } finally {
@@ -464,8 +484,11 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
   const session = loadPersistedJdSession();
   const skuId = identity.skuId || identity.id;
   const mobileUrl = `https://item.m.jd.com/product/${skuId}.html`;
-
-  const res = await fetch(mobileUrl, {
+  const mobileResult = hasJdMobileAuth(session?.cookies) && !session?.authExpiredAt
+    ? await scrapeJdMobileQuote(skuId, signal) : null;
+  const mobileBrowserIssue = typeof mobileResult === 'string' ? mobileResult : null;
+  const mobileQuote = typeof mobileResult === 'object' ? mobileResult : null;
+  const res = mobileResult ? null : await fetch(mobileUrl, {
     signal: AbortSignal.any([signal, AbortSignal.timeout(12000)]),
     headers: {
       'User-Agent': MOBILE_UA,
@@ -474,7 +497,8 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     },
   }).catch(() => null);
 
-  const html = res?.ok && !jdProductPageIssue(res.url) ? await res.text().catch(() => '') : '';
+  let mobileIssue = jdProductResponseIssue(res?.url ?? '', res?.status);
+  const html = res?.ok && !mobileIssue ? await res.text().catch(() => '') : '';
   let itemInfo: JdMobileItemInfo = {};
   let brandName = '京东商品';
 
@@ -507,6 +531,10 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
       .match(/<title>([^<]+)<\/title>/i)?.[1]
       ?.replace(/【图片\s*价格\s*品牌\s*评论】-京东.*$/, '')
       .trim() || '';
+  if (isJdVerificationTitle(htmlTitle)) {
+    mobileIssue = 'JD_VERIFICATION_REQUIRED';
+    itemInfo = {};
+  }
 
   // 优先读取未被字体混淆的 ext.jdPrice / ORIGINAL.salePrice
   const mobileReference =
@@ -514,10 +542,8 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     parseCleanNumericPrice(itemInfo.priceFloor?.ext?.realPriceExt?.ORIGINAL?.salePrice);
   const mobilePrice = mobileReference || parseCleanNumericPrice(itemInfo.priceFloor?.price);
 
-  // 优先读取已登录的手机商品页，缺少报价时沿用电脑端采集。
-  const mobileQuote = hasJdMobileAuth(session?.cookies) && !session?.authExpiredAt
-    ? await scrapeJdMobileQuote(skuId, mobileReference, signal) : null;
-  const pcResult = mobileQuote ? null : await scrapeJdPcRichDetail(skuId, signal);
+  // Do not try another route when JD has explicitly restricted this collection.
+  const pcResult = mobileResult || mobileIssue ? null : await scrapeJdPcRichDetail(skuId, signal);
   const quote = mobileQuote ?? (typeof pcResult === 'string' ? null : pcResult);
   const mobileItem = mobileQuote?.mobileItem;
   const product = mobileItem?.product ?? itemInfo.product;
@@ -543,17 +569,14 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
   const pagePrice = quote?.pagePrice || mobilePrice;
   if (!pagePrice || pagePrice <= 0) {
     const pcIssue = typeof pcResult === 'string' ? pcResult : null;
-    const mobileIssue = jdProductPageIssue(res?.url ?? '') ??
-      (res?.status === 429 ? 'JD_RATE_LIMITED' : res?.status === 403 ? 'JD_PRICE_ACCESS_DENIED' : null);
-    const code = pcIssue === 'JD_RATE_LIMITED' || mobileIssue === 'JD_RATE_LIMITED'
-      ? 'JD_RATE_LIMITED'
-      : pcIssue ?? mobileIssue ?? 'JD_PRICE_UNAVAILABLE';
+    const code = mobileBrowserIssue ?? mobileIssue ?? pcIssue ?? 'JD_PRICE_UNAVAILABLE';
     productLogger.warn(JSON.stringify({
       event: 'jd_product_collection_failed',
       collectionId: randomUUID(),
       skuId,
       code,
       mobileStatus: res?.status ?? null,
+      mobileBrowserIssue,
       mobileIssue,
       pcIssue,
       elapsedMs: Date.now() - startedAt,
