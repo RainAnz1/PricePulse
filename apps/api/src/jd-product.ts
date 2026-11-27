@@ -469,6 +469,9 @@ async function scrapeJdMobileQuote(
         mobileItem: detail.mobileItem,
         htmlText: '',
       };
+    } catch {
+      signal.throwIfAborted();
+      return jdProductPageIssue(page.url());
     } finally {
       detachTimeout();
       await page.close().catch(() => {});
@@ -484,11 +487,11 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
   const session = loadPersistedJdSession();
   const skuId = identity.skuId || identity.id;
   const mobileUrl = `https://item.m.jd.com/product/${skuId}.html`;
-  const mobileResult = hasJdMobileAuth(session?.cookies) && !session?.authExpiredAt
-    ? await scrapeJdMobileQuote(skuId, signal) : null;
+  const useMobileSession = hasJdMobileAuth(session?.cookies) && !session?.authExpiredAt;
+  const mobileResult = useMobileSession ? await scrapeJdMobileQuote(skuId, signal) : null;
   const mobileBrowserIssue = typeof mobileResult === 'string' ? mobileResult : null;
   const mobileQuote = typeof mobileResult === 'object' ? mobileResult : null;
-  const res = mobileResult ? null : await fetch(mobileUrl, {
+  const res = useMobileSession ? null : await fetch(mobileUrl, {
     signal: AbortSignal.any([signal, AbortSignal.timeout(12000)]),
     headers: {
       'User-Agent': MOBILE_UA,
@@ -543,8 +546,12 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
   const mobilePrice = mobileReference || parseCleanNumericPrice(itemInfo.priceFloor?.price);
 
   // Do not try another route when JD has explicitly restricted this collection.
-  const pcResult = mobileResult || mobileIssue ? null : await scrapeJdPcRichDetail(skuId, signal);
-  const quote = mobileQuote ?? (typeof pcResult === 'string' ? null : pcResult);
+  signal.throwIfAborted();
+  const pcResult = mobileBrowserIssue || mobileIssue || mobileQuote?.finalPrice != null
+    ? null : await scrapeJdPcRichDetail(skuId, signal);
+  const pcIssue = typeof pcResult === 'string' ? pcResult : null;
+  const pcQuote = typeof pcResult === 'object' ? pcResult : null;
+  const quote = pcQuote?.finalPrice != null ? pcQuote : mobileQuote ?? pcQuote;
   const mobileItem = mobileQuote?.mobileItem;
   const product = mobileItem?.product ?? itemInfo.product;
   const title = [
@@ -568,7 +575,6 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
 
   const pagePrice = quote?.pagePrice || mobilePrice;
   if (!pagePrice || pagePrice <= 0) {
-    const pcIssue = typeof pcResult === 'string' ? pcResult : null;
     const code = mobileBrowserIssue ?? mobileIssue ?? pcIssue ?? 'JD_PRICE_UNAVAILABLE';
     productLogger.warn(JSON.stringify({
       event: 'jd_product_collection_failed',
@@ -598,7 +604,7 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     observedCouponPrice: quote?.couponPrice,
     observedSubsidyDiscount: quote?.subsidyDiscount,
     observedSubsidyLabel: quote?.subsidyLabel,
-    observedCoupons: quote?.coupons,
+    observedCoupons: quote?.coupons.length ? quote.coupons : mobileQuote?.coupons,
     hasExplicitSubsidyPrice: quote?.hasExplicitSubsidyPrice,
     useObservedPriceOnly: true,
   });

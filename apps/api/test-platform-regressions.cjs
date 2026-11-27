@@ -489,12 +489,15 @@ test('JD stops after a confirmed frequency restriction and does not try other ro
   Object.defineProperty(limitedResponse, 'url', { value: 'https://trade.m.jd.com/common/limit.html' });
   const request = t.mock.method(globalThis, 'fetch', async () => limitedResponse);
   let signedIn = false;
+  let navigationTimedOut = false;
   t.mock.method(sessionModule, 'loadPersistedJdSession', () => signedIn
     ? { cookies: { pt_key: 'fixture-key', pt_pin: 'fixture-pin' } } : null);
   const page = {
     on() {},
     async route() {},
-    async goto() {},
+    async goto() {
+      if (navigationTimedOut) throw new Error('navigation timed out after the redirect');
+    },
     async waitForTimeout() {},
     url: () => 'https://trade.m.jd.com/common/limit.html',
     evaluate: t.mock.fn(async () => ({})),
@@ -516,10 +519,12 @@ test('JD stops after a confirmed frequency restriction and does not try other ro
   assert.equal(browser.mock.callCount(), 0);
   signedIn = true;
   await assert.rejects(scrapeAndUpsertProduct(url), expectLimit);
+  navigationTimedOut = true;
+  await assert.rejects(scrapeAndUpsertProduct(url), expectLimit);
   assert.equal(request.mock.callCount(), 1);
-  assert.equal(browser.mock.callCount(), 1);
+  assert.equal(browser.mock.callCount(), 2);
   assert.equal(page.evaluate.mock.callCount(), 0);
-  assert.equal(page.close.mock.callCount(), 1);
+  assert.equal(page.close.mock.callCount(), 2);
 });
 
 test('a rate-limited JD import is saved with unconfirmed stock and no price samples', async t => {
@@ -669,11 +674,14 @@ test('JD uses the observed mobile quote when the page object has a trailing comm
   assert.equal(page.close.mock.callCount(), 1);
 });
 
-test('JD collects the signed-in mobile page once and keeps a reference-only item monitorable', async t => {
+test('JD uses one desktop follow-up when the signed-in mobile page has no confirmed offer', async t => {
   const url = 'https://item.m.jd.com/product/12345678.html';
+  const desktopUrl = 'https://item.jd.com/12345678.html';
   const visited = [];
   const scrolls = [];
   let mobilePriceText = '¥2,898.00';
+  let desktopPrice;
+  let mobileNetworkFailed = false;
   t.mock.method(sessionModule, 'loadPersistedJdSession', () => ({
     cookies: { pt_key: 'fixture-key', pt_pin: 'fixture-pin' },
   }));
@@ -685,9 +693,10 @@ test('JD collects the signed-in mobile page once and keeps a reference-only item
         async goto(href) {
           destination = href;
           visited.push(href);
+          if (destination === url && mobileNetworkFailed) throw new Error('mobile connection interrupted');
           return { ok: () => true, status: () => 200 };
         },
-        url: () => destination === url ? url : 'https://pc-frequent-pro.pf.jd.com/',
+        url: () => destination === desktopUrl && desktopPrice === undefined ? 'https://pc-frequent-pro.pf.jd.com/' : destination,
         locator(selector) {
           assert.equal(selector, '#priceSpec #defaultDesc + span');
           return {
@@ -698,8 +707,16 @@ test('JD collects the signed-in mobile page once and keeps a reference-only item
         },
         async waitForFunction() {},
         async waitForTimeout() {},
-        async evaluate(_task, skuId) {
+        async evaluate(task, skuId) {
           assert.equal(skuId, '12345678');
+          if (destination === desktopUrl) {
+            if (!String(task).includes('priceAreaText')) return true;
+            return {
+              priceAreaText: '', labeledMainPrice: `¥${desktopPrice} 国补领后价`,
+              jpText: desktopPrice, pageOriginPriceText: '¥3698',
+              pPriceText: '', handPriceElText: '', quanAreaText: '',
+            };
+          }
           return {
             title: '一加测试商品',
             offer: mobilePriceText === null ? null : {
@@ -744,10 +761,18 @@ test('JD collects the signed-in mobile page once and keeps a reference-only item
   assert.equal(pending.finalPrice, null);
   assert.equal(pending.subsidyPrice, null);
   mobilePriceText = null;
-  const referenceOnly = await scrapeJdProduct(identity, new AbortController().signal);
-  assert.equal(referenceOnly.pagePrice, 3698);
-  assert.equal(referenceOnly.finalPrice, null);
-  assert.deepEqual(visited, [url, url, url]);
+  desktopPrice = '3299.50';
+  const supplemented = await scrapeJdProduct(identity, new AbortController().signal);
+  assert.equal(supplemented.pagePrice, 3698);
+  assert.equal(supplemented.finalPrice, 3299.50);
+  assert.equal(supplemented.subsidyPrice, 3299.50);
+  assert.equal(supplemented.title, '一加测试商品');
+  assert.deepEqual(supplemented.coupons, ['满3000元减200元', '单品满1件减100元']);
+
+  mobileNetworkFailed = true;
+  const afterNetworkFailure = await scrapeJdProduct(identity, new AbortController().signal);
+  assert.equal(afterNetworkFailure.finalPrice, 3299.50);
+  assert.deepEqual(visited, [url, url, desktopUrl, url, desktopUrl, url, desktopUrl]);
   assert.equal(request.mock.callCount(), 0);
 });
 
