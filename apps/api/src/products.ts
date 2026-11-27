@@ -63,6 +63,8 @@ export interface MonitoredProduct extends CollectedProduct {
 }
 
 let monitorInterval: NodeJS.Timeout | null = null;
+const productMonitorInterval = 15 * 60 * 1000;
+const waitingForJdPriceMessage = '京东暂时限制访问，链接已保存，等待巡检采集价格。';
 
 function getProductsStorePath(): string {
   return join(getDataRoot(), 'PriceDrop', 'data', 'products.json');
@@ -203,10 +205,83 @@ function productCollectionBusy(key: string, reason: 'queue_full' | 'queue_timeou
 }
 
 export async function scrapeAndUpsertProduct(
-  rawUrl?: string, { waitForSlot = true, access }: TaobaoCollectionOptions & { waitForSlot?: boolean } = {},
+  rawUrl?: string,
+  { waitForSlot = true, access, saveOnJdRateLimit = false }:
+    TaobaoCollectionOptions & { waitForSlot?: boolean; saveOnJdRateLimit?: boolean } = {},
 ): Promise<ProductScrapeResult> {
   const identity = await resolveAndParseProductUrl(rawUrl);
   const key = `${identity.platform}:${identity.id}:${identity.skuId || 'default'}`;
+  if (identity.platform === 'jd') {
+    const pending = loadMonitoredProducts().find(product => product.key === key && product.priceHistory.length === 0);
+    if (pending && Date.now() - Date.parse(pending.createdAt) < productMonitorInterval) {
+      return { product: pending, isNew: false, priceDropped: false, feishuPushed: false };
+    }
+  }
+
+  try {
+    return await enqueueProductScrape(identity, key, { access, waitForSlot });
+  } catch (error) {
+    const response = error instanceof BadRequestException ? error.getResponse() : null;
+    if (saveOnJdRateLimit && identity.platform === 'jd' && response && typeof response === 'object' &&
+        'code' in response && response.code === 'JD_RATE_LIMITED') {
+      const products = loadMonitoredProducts();
+      const existing = products.find(product => product.key === key);
+      if (!existing) {
+        const product = savePendingJdProduct(identity, key, products);
+        return { product, isNew: true, priceDropped: false, feishuPushed: false };
+      }
+      if (existing.priceHistory.length === 0) {
+        return { product: existing, isNew: false, priceDropped: false, feishuPushed: false };
+      }
+    }
+    throw error;
+  }
+}
+
+function savePendingJdProduct(identity: ProductIdentity, key: string, products: MonitoredProduct[]): MonitoredProduct {
+  const now = new Date().toISOString();
+  const product: MonitoredProduct = {
+    key,
+    platform: 'jd',
+    platformLabel: '京东',
+    id: identity.id,
+    skuId: identity.skuId,
+    canonicalUrl: identity.canonicalUrl,
+    title: identity.hintTitle && !isJdVerificationTitle(identity.hintTitle) ? identity.hintTitle : `京东商品 #${identity.id}`,
+    imageUrl: '',
+    shopName: '店铺待采集',
+    brandName: '京东商品',
+    spec: '规格待采集',
+    category: '',
+    inStock: false,
+    stockText: '库存待确认',
+    pagePrice: 0,
+    couponPrice: null,
+    subsidyPrice: null,
+    finalPrice: null,
+    coupons: [],
+    couponDiscount: 0,
+    hasSubsidy: false,
+    subsidyLabel: null,
+    subsidyDiscount: 0,
+    allTimeLow: null,
+    allTimeLowAt: null,
+    allTimeHigh: null,
+    initialPrice: null,
+    previousFinalPrice: null,
+    lastDropAmount: 0,
+    historySource: 'observed',
+    priceHistory: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+  saveMonitoredProducts([product, ...products]);
+  return product;
+}
+
+function enqueueProductScrape(
+  identity: ProductIdentity, key: string, { access, waitForSlot }: TaobaoCollectionOptions & { waitForSlot: boolean },
+): Promise<ProductScrapeResult> {
   if (activeScrape?.key === key) return activeScrape.response;
   if (pendingScrape?.key === key) return pendingScrape.response;
   if (!activeScrape && !pendingScrape) return startProductScrape(identity, key, { access });
@@ -274,7 +349,7 @@ async function scrapeAndSaveProduct(
     subsidyPrice: scraped.subsidyPrice,
     finalPrice: scraped.finalPrice,
     inStock: scraped.inStock,
-    note: existing ? '实时巡检采集' : '首次添加采集',
+    note: existing?.priceHistory.length ? '实时巡检采集' : '首次添加采集',
   };
 
   const priceHistory = [...(existing?.priceHistory ?? []), newPoint].slice(-180);
@@ -386,7 +461,7 @@ export class ProductsController implements OnModuleInit {
             // ignore single item failure during background poll
           }
         }
-      }, 15 * 60 * 1000);
+      }, productMonitorInterval);
       monitorInterval.unref?.();
     }
   }
@@ -400,13 +475,13 @@ export class ProductsController implements OnModuleInit {
 
   @Get('parse')
   async parse(@Query('url') input?: string, @Req() req?: Request) {
-    return this.formatCollection(await this.collect(input, req));
+    return this.formatCollection(await this.collect(input, req, true));
   }
 
-  private async collect(input?: string, req?: Request) {
+  private async collect(input?: string, req?: Request, saveOnJdRateLimit = false) {
     const access = verificationAccess(req);
     try {
-      return await scrapeAndUpsertProduct(input, { access });
+      return await scrapeAndUpsertProduct(input, { access, saveOnJdRateLimit });
     } catch (error) {
       throw errorWithVerificationWindow(error, access);
     }
@@ -422,7 +497,7 @@ export class ProductsController implements OnModuleInit {
       isNew,
       priceDropped,
       feishuPushed,
-      message: `${isNew ? '已加入实时监控' : '已刷新最新价格'}：页面标价 ¥${product.pagePrice.toFixed(2)}${
+      message: product.priceHistory.length === 0 ? waitingForJdPriceMessage : `${isNew ? '已加入实时监控' : '已刷新最新价格'}：页面标价 ¥${product.pagePrice.toFixed(2)}${
         product.couponPrice !== null ? ` ｜ 券后 ¥${product.couponPrice.toFixed(2)}` : ''
       }${subsidyNote}`,
     };
@@ -495,7 +570,7 @@ export class ProductsController implements OnModuleInit {
     const result = await this.collect(target.canonicalUrl, req);
     return {
       ...result,
-      message: `已刷新「${result.product.title.slice(0, 24)}…」${result.product.finalPrice === null
+      message: result.product.priceHistory.length === 0 ? waitingForJdPriceMessage : `已刷新「${result.product.title.slice(0, 24)}…」${result.product.finalPrice === null
         ? `页面价格 ¥${result.product.pagePrice.toFixed(2)}，暂未采到到手价`
         : `最新到手价 ¥${result.product.finalPrice.toFixed(2)}`}`,
     };

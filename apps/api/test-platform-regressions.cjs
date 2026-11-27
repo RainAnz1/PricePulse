@@ -522,6 +522,58 @@ test('JD stops after a confirmed frequency restriction and does not try other ro
   assert.equal(page.close.mock.callCount(), 1);
 });
 
+test('a rate-limited JD import is saved with unconfirmed stock and no price samples', async t => {
+  const previousRoot = process.env.LOCALAPPDATA;
+  const root = mkdtempSync(join(tmpdir(), 'pricepulse-pending-jd-'));
+  process.env.LOCALAPPDATA = root;
+  t.after(() => {
+    if (previousRoot === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousRoot;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  let limited = true;
+  const fetchProduct = t.mock.method(globalThis, 'fetch', async () => limited
+    ? new Response(null, { status: 429 })
+    : new Response('window._itemInfo = ({"product":{"skuId":"12345678","skuName":"通过京东验证的商品"},' +
+      '"priceFloor":{"ext":{"jdPrice":"159.00"}}});'));
+  const browser = t.mock.method(sessionModule, 'getJdHeadlessContext', async () => ({
+    newPage: async () => ({
+      on() {}, async goto() {}, async close() {}, url: () => 'https://pc-frequent-pro.pf.jd.com/',
+    }),
+  }));
+  const controller = new ProductsController();
+  const url = 'https://item.jd.com/12345678.html';
+  const product = await controller.parse(url + '?spmTag=ignored');
+  assert.equal(product.isNew, true);
+  assert.equal(product.platformLabel, '京东');
+  assert.equal(product.canonicalUrl, url);
+  assert.equal(product.stockText, '库存待确认');
+  assert.match(product.message, /链接已保存/);
+  assert.equal(product.finalPrice, null);
+  assert.equal(product.allTimeLow, null);
+  assert.deepEqual(product.priceHistory, []);
+  assert.deepEqual(new ProductsController().list().products.map(item => item.key), [product.key]);
+  assert.equal((await controller.parse(url)).isNew, false);
+  const earlyRefresh = await controller.refreshOne(product.key, { get: () => undefined });
+  assert.match(earlyRefresh.message, /等待巡检/);
+  assert.equal(fetchProduct.mock.callCount(), 1);
+  assert.equal(browser.mock.callCount(), 0);
+
+  t.mock.method(Date, 'now', () => Date.parse(product.createdAt) + 15 * 60 * 1000);
+  limited = false;
+  const { product: collected } = await scrapeAndUpsertProduct(url, { waitForSlot: false });
+  assert.equal(collected.key, product.key);
+  assert.equal(collected.pagePrice, 159);
+  assert.equal(collected.finalPrice, null);
+  assert.equal(collected.priceHistory.length, 1);
+  assert.equal(collected.priceHistory[0].note, '首次添加采集');
+  assert.equal(collected.priceHistory[0].pagePrice, 159);
+  limited = true;
+  await assert.rejects(controller.parse(url), error => error.getResponse().code === 'JD_RATE_LIMITED');
+  assert.deepEqual(controller.list().products, [collected]);
+});
+
 test('JD uses the observed mobile quote when the page object has a trailing comma and desktop is limited', async t => {
   const identity = { platform: 'jd', id: '12345678', skuId: '12345678', canonicalUrl: 'https://item.jd.com/12345678.html' };
   const itemInfo = JSON.stringify({

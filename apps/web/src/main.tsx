@@ -2125,7 +2125,7 @@ function App() {
                                   {item.platformLabel || (item.platform === 'jd' ? '京东' : '淘宝')}
                                 </span>
                                 <span className="dot-sep">·</span>
-                                <span className={item.inStock ? 'status-text green' : 'status-text red'}>
+                                <span className={item.priceHistory.length === 0 ? 'status-text' : item.inStock ? 'status-text green' : 'status-text red'}>
                                   {item.stockText}
                                 </span>
                                 {dropped ? (
@@ -2199,7 +2199,7 @@ function App() {
                           <span>·</span>
                           <span>{selectedProduct.shopName}</span>
                           <span>·</span>
-                          <span className={selectedProduct.inStock ? 'status-text green' : 'status-text red'}>
+                          <span className={selectedProduct.priceHistory.length === 0 ? 'status-text' : selectedProduct.inStock ? 'status-text green' : 'status-text red'}>
                             {selectedProduct.stockText}
                           </span>
                         </div>
