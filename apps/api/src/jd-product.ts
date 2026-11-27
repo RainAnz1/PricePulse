@@ -354,9 +354,10 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
     if (jsonStart > 0 && endIdx > jsonStart) {
       try {
         const rawLiteral = html.slice(jsonStart, endIdx);
-        itemInfo = JSON.parse(rawLiteral) as JdMobileItemInfo;
+        // The page embeds a JavaScript object and may leave a trailing comma on the root object.
+        itemInfo = JSON.parse(rawLiteral.replace(/,\s*}$/, '}')) as JdMobileItemInfo;
       } catch {
-        // fallback to regex parsing below
+        // The desktop page can still provide a quote.
       }
     }
   }

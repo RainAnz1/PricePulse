@@ -5,6 +5,7 @@ const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { test } = require('node:test');
 const { readJdDisplayedPrice, resolveJdPrice } = require('./dist/jd-price');
+const { scrapeJdProduct } = require('./dist/jd-product');
 const { saveFeishuConfig } = require('./dist/feishu');
 const { ProductsController, scrapeAndUpsertProduct } = require('./dist/products');
 const { RemoteBrowserControls } = require('./dist/remote-browser-controls');
@@ -369,6 +370,28 @@ test('JD frequency controls are reported separately from login', async t => {
     return true;
   });
   assert.equal(page.evaluate.mock.callCount(), 0);
+  assert.equal(page.close.mock.callCount(), 1);
+});
+
+test('JD uses the observed mobile quote when the page object has a trailing comma and desktop is limited', async t => {
+  const identity = { platform: 'jd', id: '12345678', skuId: '12345678', canonicalUrl: 'https://item.jd.com/12345678.html' };
+  const itemInfo = JSON.stringify({
+    product: { skuId: identity.skuId, skuName: '测试商品' },
+    priceFloor: { price: '1??', ext: { jdPrice: '159.00' } },
+  }).replace(/}$/, ',\n}');
+  t.mock.method(globalThis, 'fetch', async () => new Response(`<script>window._itemInfo = (${itemInfo});\n</script>`));
+  const page = {
+    on() {},
+    async goto() {},
+    url: () => 'https://pc-frequent-pro.pf.jd.com/',
+    close: t.mock.fn(async () => {}),
+  };
+  t.mock.method(sessionModule, 'getJdHeadlessContext', async () => ({ newPage: async () => page }));
+
+  const product = await scrapeJdProduct(identity, AbortSignal.timeout(5000));
+  assert.equal(product.title, '测试商品');
+  assert.equal(product.pagePrice, 159);
+  assert.equal(product.finalPrice, 159);
   assert.equal(page.close.mock.callCount(), 1);
 });
 
