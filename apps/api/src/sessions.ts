@@ -85,7 +85,7 @@ const loginPages = {
   jd: 'https://passport.jd.com/new/login.aspx?ReturnUrl=https%3A%2F%2Fwww.jd.com%2F',
   taobao: 'https://login.taobao.com/havanaone/login/login.htm?bizName=taobao&sub=true',
 };
-const jdMobileLoginUrl = 'https://plogin.m.jd.com/login/login?appid=100&returnurl=https%3A%2F%2Fm.jd.com%2F';
+const jdMobileLoginEntry = 'https://my.m.jd.com/';
 const jdMobileLoginPages = new WeakSet<Page>();
 
 function platformUrl(value: string | undefined, platform: Platform, base = loginPages[platform]): URL | null {
@@ -1071,7 +1071,7 @@ export class SessionsController implements OnModuleInit, OnModuleDestroy {
     if (mobileLogin) jdMobileLoginPages.add(page);
     else jdMobileLoginPages.delete(page);
     if (wasMobile !== mobileLogin || !options?.keepCurrent || !platformUrl(page.url(), platform)) {
-      await page.goto(mobileLogin ? jdMobileLoginUrl : loginPages[platform], { waitUntil: 'domcontentloaded', timeout: 15000 })
+      await page.goto(mobileLogin ? jdMobileLoginEntry : loginPages[platform], { waitUntil: 'domcontentloaded', timeout: 15000 })
         .catch(() => {});
     }
     return page;

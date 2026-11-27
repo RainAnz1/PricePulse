@@ -201,7 +201,10 @@ test('JD mobile login saves credentials only after returning to JD with both sco
   const page = Object.assign(new EventEmitter(), {
     href: 'about:blank',
     closed: false,
-    async goto(url) { this.href = url; },
+    async goto(url) {
+      assert.equal(url, 'https://my.m.jd.com/');
+      this.href = 'https://plogin.m.jd.com/login/login?appid=300';
+    },
     url() { return this.href; },
     isClosed() { return this.closed; },
     async close() { this.closed = true; this.emit('close'); },
@@ -223,7 +226,7 @@ test('JD mobile login saves credentials only after returning to JD with both sco
   assert.equal(start.state, 'verify_required');
   assert.equal(start.url, 'https://plogin.m.jd.com/login/login');
 
-  page.href = 'https://m.jd.com/';
+  page.href = 'https://my.m.jd.com/';
   cookies.push(cookie('pt_key', 'key-fixture'));
   assert.equal((await controller.getRemoteBrowserFrame('jd', request)).state, 'verify_required');
   assert.deepEqual(loadPersistedJdSession().cookies, { thor: desktop.value });
