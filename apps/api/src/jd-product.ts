@@ -356,7 +356,7 @@ async function scrapeJdMobileQuote(
       );
       await page.waitForFunction(() => document.fonts.status === 'loaded', undefined, { timeout: 1500 });
       const quote = await page.evaluate(id => {
-        const item = (window as Window & { _itemInfo?: { product?: { skuId?: string | number } } })._itemInfo;
+        const item = (window as Window & { _itemInfo?: JdMobileItemInfo })._itemInfo;
         const label = document.querySelector<HTMLElement>('#priceSpec #defaultDesc');
         const value = label?.nextElementSibling as HTMLElement | null | undefined;
         if (String(item?.product?.skuId) !== id ||
@@ -402,17 +402,25 @@ async function scrapeJdMobileQuote(
             }
           }
         }
-        return { label: label.innerText.trim(), text: value.innerText.trim(), clip: { x, y, width, height }, promotions: [...promotions] };
+        return {
+          label: label.innerText.trim(),
+          text: value.innerText.trim(),
+          clip: { x, y, width, height },
+          promotions: [...promotions],
+          sellingPrice: item?.priceFloor?.ext?.jdPrice,
+          originalPrice: item?.priceFloor?.ext?.realPriceExt?.ORIGINAL?.salePrice,
+        };
       }, skuId);
       if (!quote || !onProduct()) return null;
       const kind = jdOfferLabelKind(quote.label);
       const shape = jdVisiblePriceShape(quote.text);
-      if (!kind || !shape) return null;
+      const pagePrice = parseCleanNumericPrice(quote.sellingPrice) || parseCleanNumericPrice(quote.originalPrice) || referencePrice;
+      if (!kind || !shape || !pagePrice) return null;
       const plainPrice = /^(?:[¥￥]\s*)?\d[\d,.]*$/.test(quote.text) ? parseCleanNumericPrice(quote.text) : 0;
       const price = plainPrice || await readJdPriceImage(await page.screenshot({ clip: quote.clip, timeout: 3000 }), shape, signal);
-      if (!price || !onProduct() || (referencePrice > 0 && price > referencePrice)) return null;
+      if (!price || price > pagePrice || !onProduct()) return null;
       return {
-        pagePrice: referencePrice || price,
+        pagePrice,
         finalPrice: price,
         couponPrice: 0,
         subsidyDiscount: 0,
@@ -507,14 +515,14 @@ export async function scrapeJdProduct(identity: ProductIdentity, signal: AbortSi
           : '无货 / 下架';
 
   // 优先读取未被字体混淆的 ext.jdPrice / ORIGINAL.salePrice
-  const mobilePrice =
+  const mobileReference =
     parseCleanNumericPrice(itemInfo.priceFloor?.ext?.jdPrice) ||
-    parseCleanNumericPrice(itemInfo.priceFloor?.ext?.realPriceExt?.ORIGINAL?.salePrice) ||
-    parseCleanNumericPrice(itemInfo.priceFloor?.price);
+    parseCleanNumericPrice(itemInfo.priceFloor?.ext?.realPriceExt?.ORIGINAL?.salePrice);
+  const mobilePrice = mobileReference || parseCleanNumericPrice(itemInfo.priceFloor?.price);
 
   // 优先读取已登录的手机商品页，缺少报价时沿用电脑端采集。
   const mobileQuote = hasJdMobileAuth(session?.cookies) && !session?.authExpiredAt
-    ? await scrapeJdMobileQuote(skuId, mobilePrice, signal) : null;
+    ? await scrapeJdMobileQuote(skuId, mobileReference, signal) : null;
   const pcResult = mobileQuote ? null : await scrapeJdPcRichDetail(skuId, signal);
   const quote = mobileQuote ?? (typeof pcResult === 'string' ? null : pcResult);
   if (quote?.title && title.startsWith('京东商品 #')) title = quote.title;

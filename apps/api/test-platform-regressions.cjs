@@ -500,6 +500,7 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
   const visited = [];
   const scrolls = [];
   let mobilePriceText = '¥2,898.00';
+  let rawPagePrice = '{"price":"2,898.00"}';
   t.mock.method(sessionModule, 'loadPersistedJdSession', () => ({
     cookies: { pt_key: 'fixture-key', pt_pin: 'fixture-pin' },
   }));
@@ -531,6 +532,7 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
             text: mobilePriceText,
             clip: { x: 40, y: 55, width: 84, height: 34 },
             promotions: ['满3000元减200元', '单品满1件减100元'],
+            sellingPrice: '3698.00',
           };
         },
         async close() {},
@@ -538,7 +540,7 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
     },
   }));
   t.mock.method(globalThis, 'fetch', async () => new Response(
-    'window._itemInfo = ({"product":{"skuName":"测试商品"},"priceFloor":{"ext":{"jdPrice":"3698"}}});',
+    `window._itemInfo = ({"product":{"skuName":"测试商品"},"priceFloor":${rawPagePrice}});`,
   ));
   const identity = { id: '12345678', skuId: '12345678', platform: 'jd', canonicalUrl: url };
   const quote = await scrapeJdProduct(identity, new AbortController().signal);
@@ -553,6 +555,7 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
   assert.deepEqual(visited, [url]);
   assert.deepEqual(scrolls, [{ block: 'center', inline: 'nearest', behavior: 'instant' }]);
 
+  rawPagePrice = '{"ext":{"jdPrice":"3698"}}';
   mobilePriceText = '¥????.??';
   const pending = await scrapeJdProduct(identity, new AbortController().signal);
   assert.equal(pending.pagePrice, 3698);
