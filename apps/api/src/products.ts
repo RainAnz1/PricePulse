@@ -8,6 +8,7 @@ import {
   Get,
   Header,
   NotFoundException,
+  OnModuleDestroy,
   OnModuleInit,
   Param,
   Post,
@@ -60,10 +61,13 @@ export interface MonitoredProduct extends CollectedProduct {
   priceHistory: PriceHistoryPoint[];
   createdAt: string;
   updatedAt: string;
+  lastAutomaticCollectionAt?: string;
 }
 
 let monitorInterval: NodeJS.Timeout | null = null;
-const productMonitorInterval = 15 * 60 * 1000;
+const automaticCollectionInterval = 60 * 60 * 1000;
+const monitorTick = 60 * 1000;
+const firstJdRetryDelay = 15 * 60 * 1000;
 const waitingForJdPriceMessage = '京东暂时限制访问，链接已保存，等待巡检采集价格。';
 
 function getProductsStorePath(): string {
@@ -190,6 +194,12 @@ interface ProductScrapeRequest {
   response: Promise<ProductScrapeResult>;
 }
 
+type ProductCollectionOptions = TaobaoCollectionOptions & {
+  automatic?: boolean;
+  waitForSlot?: boolean;
+  saveOnJdRateLimit?: boolean;
+};
+
 let activeScrape: (ProductScrapeRequest & { finished: Promise<void> }) | undefined;
 let pendingScrape: ProductScrapeRequest | undefined;
 
@@ -206,20 +216,19 @@ function productCollectionBusy(key: string, reason: 'queue_full' | 'queue_timeou
 
 export async function scrapeAndUpsertProduct(
   rawUrl?: string,
-  { waitForSlot = true, access, saveOnJdRateLimit = false }:
-    TaobaoCollectionOptions & { waitForSlot?: boolean; saveOnJdRateLimit?: boolean } = {},
+  { waitForSlot = true, access, saveOnJdRateLimit = false, automatic = false }: ProductCollectionOptions = {},
 ): Promise<ProductScrapeResult> {
   const identity = await resolveAndParseProductUrl(rawUrl);
   const key = `${identity.platform}:${identity.id}:${identity.skuId || 'default'}`;
   if (identity.platform === 'jd') {
     const pending = loadMonitoredProducts().find(product => product.key === key && product.priceHistory.length === 0);
-    if (pending && Date.now() - Date.parse(pending.createdAt) < productMonitorInterval) {
+    if (pending && Date.now() - Date.parse(pending.createdAt) < firstJdRetryDelay) {
       return { product: pending, isNew: false, priceDropped: false, feishuPushed: false };
     }
   }
 
   try {
-    return await enqueueProductScrape(identity, key, { access, waitForSlot });
+    return await enqueueProductScrape(identity, key, { access, waitForSlot, automatic });
   } catch (error) {
     const response = error instanceof BadRequestException ? error.getResponse() : null;
     if (saveOnJdRateLimit && identity.platform === 'jd' && response && typeof response === 'object' &&
@@ -280,11 +289,11 @@ function savePendingJdProduct(identity: ProductIdentity, key: string, products: 
 }
 
 function enqueueProductScrape(
-  identity: ProductIdentity, key: string, { access, waitForSlot }: TaobaoCollectionOptions & { waitForSlot: boolean },
+  identity: ProductIdentity, key: string, { access, waitForSlot, automatic }: ProductCollectionOptions,
 ): Promise<ProductScrapeResult> {
   if (activeScrape?.key === key) return activeScrape.response;
   if (pendingScrape?.key === key) return pendingScrape.response;
-  if (!activeScrape && !pendingScrape) return startProductScrape(identity, key, { access });
+  if (!activeScrape && !pendingScrape) return startProductScrape(identity, key, { access, automatic });
   if (!waitForSlot) throw new ServiceUnavailableException('服务端正在采集另一个商品');
   if (!activeScrape || pendingScrape) throw productCollectionBusy(key, 'queue_full');
 
@@ -297,7 +306,7 @@ function enqueueProductScrape(
     .then(() => {
       clearTimeout(waitTimer);
       pendingScrape = undefined;
-      return startProductScrape(identity, key, { access });
+      return startProductScrape(identity, key, { access, automatic });
     })
     .finally(() => {
       clearTimeout(waitTimer);
@@ -308,7 +317,7 @@ function enqueueProductScrape(
 }
 
 function startProductScrape(
-  identity: ProductIdentity, key: string, options: TaobaoCollectionOptions,
+  identity: ProductIdentity, key: string, options: ProductCollectionOptions,
 ): Promise<ProductScrapeResult> {
   const signal = AbortSignal.timeout(45000);
   function releaseSlot() {
@@ -329,8 +338,15 @@ function startProductScrape(
 }
 
 async function scrapeAndSaveProduct(
-  identity: ProductIdentity, key: string, signal: AbortSignal, options: TaobaoCollectionOptions,
+  identity: ProductIdentity, key: string, signal: AbortSignal, options: ProductCollectionOptions,
 ): Promise<ProductScrapeResult> {
+  if (options.automatic) {
+    const products = loadMonitoredProducts();
+    const target = products.find(product => product.key === key);
+    if (!target) throw new NotFoundException('未找到该监控商品');
+    target.lastAutomaticCollectionAt = new Date().toISOString();
+    saveMonitoredProducts(products);
+  }
   const scraped =
     identity.platform === 'jd'
       ? await scrapeJdProduct(identity, signal)
@@ -339,6 +355,7 @@ async function scrapeAndSaveProduct(
   const products = loadMonitoredProducts();
   const existingIdx = products.findIndex(p => p.key === key);
   const existing = existingIdx >= 0 ? products[existingIdx] : null;
+  if (!existing && options.automatic) throw new NotFoundException('未找到该监控商品');
   const existingJd = identity.platform === 'jd' ? existing : null;
 
   const nowIso = new Date().toISOString();
@@ -349,7 +366,7 @@ async function scrapeAndSaveProduct(
     subsidyPrice: scraped.subsidyPrice,
     finalPrice: scraped.finalPrice,
     inStock: scraped.inStock,
-    note: existing?.priceHistory.length ? '实时巡检采集' : '首次添加采集',
+    note: options.automatic ? '自动巡检采集' : existing?.priceHistory.length ? '手动刷新采集' : '首次添加采集',
   };
 
   const priceHistory = [...(existing?.priceHistory ?? []), newPoint].slice(-180);
@@ -400,6 +417,7 @@ async function scrapeAndSaveProduct(
     priceHistory,
     createdAt: existing?.createdAt || nowIso,
     updatedAt: nowIso,
+    ...(existing?.lastAutomaticCollectionAt ? { lastAutomaticCollectionAt: existing.lastAutomaticCollectionAt } : {}),
   };
 
   if (existingIdx >= 0) {
@@ -447,23 +465,33 @@ async function scrapeAndSaveProduct(
   };
 }
 
+async function collectNextDueProduct() {
+  if (activeScrape || pendingScrape) return;
+  const now = Date.now();
+  const next = loadMonitoredProducts().map(product => {
+    const lastAttempt = Date.parse(product.lastAutomaticCollectionAt ?? '') || 0;
+    const lastUpdate = Date.parse(product.updatedAt) || Date.parse(product.createdAt) || 0;
+    const firstPendingCheck = product.platform === 'jd' && product.priceHistory.length === 0 && !lastAttempt;
+    const dueAt = Math.max(lastAttempt, lastUpdate) + (firstPendingCheck ? firstJdRetryDelay : automaticCollectionInterval);
+    return { product, dueAt };
+  }).filter(item => item.dueAt <= now).sort((a, b) => a.dueAt - b.dueAt)[0];
+  if (next) {
+    await scrapeAndUpsertProduct(next.product.canonicalUrl, { waitForSlot: false, automatic: true });
+  }
+}
+
 @Controller('products')
-export class ProductsController implements OnModuleInit {
+export class ProductsController implements OnModuleInit, OnModuleDestroy {
   onModuleInit() {
     if (!monitorInterval) {
-      // 每 15 分钟自动后台巡检所有已关注商品的价格变动
-      monitorInterval = setInterval(async () => {
-        const list = loadMonitoredProducts();
-        for (const item of list) {
-          try {
-            await scrapeAndUpsertProduct(item.canonicalUrl, { waitForSlot: false });
-          } catch {
-            // ignore single item failure during background poll
-          }
-        }
-      }, productMonitorInterval);
+      monitorInterval = setInterval(() => collectNextDueProduct().catch(() => {}), monitorTick);
       monitorInterval.unref?.();
     }
+  }
+
+  onModuleDestroy() {
+    if (monitorInterval) clearInterval(monitorInterval);
+    monitorInterval = null;
   }
 
   @Get()

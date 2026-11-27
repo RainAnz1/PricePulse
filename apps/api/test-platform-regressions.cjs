@@ -574,6 +574,79 @@ test('a rate-limited JD import is saved with unconfirmed stock and no price samp
   assert.deepEqual(controller.list().products, [collected]);
 });
 
+test('automatic scans wait an hour after a manual refresh or a failed automatic check', async t => {
+  const previousRoot = process.env.LOCALAPPDATA;
+  const root = mkdtempSync(join(tmpdir(), 'pricepulse-slow-collection-'));
+  process.env.LOCALAPPDATA = root;
+  const controller = new ProductsController();
+  t.after(() => {
+    controller.onModuleDestroy();
+    if (previousRoot === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousRoot;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const start = Date.parse('2026-11-27T00:00:00Z');
+  t.mock.timers.enable({ apis: ['Date'], now: start });
+  const setMinute = minute => t.mock.timers.setTime(start + minute * 60 * 1000);
+  let poll;
+  t.mock.method(globalThis, 'setInterval', (callback, interval) => {
+    assert.equal(interval, 60 * 1000);
+    poll = callback;
+    return { unref() {} };
+  });
+  const visited = [];
+  let failingSku;
+  t.mock.method(require('./dist/jd-product'), 'scrapeJdProduct', async ({ skuId }) => {
+    visited.push(skuId);
+    if (skuId === failingSku) throw new Error('try again next hour');
+    return {
+      title: '京东测试商品', imageUrl: '', shopName: '测试店铺', brandName: '测试品牌', spec: '默认规格',
+      category: '', inStock: true, stockText: '现货', pagePrice: 159, finalPrice: 149,
+      couponPrice: null, subsidyPrice: null, coupons: [], couponDiscount: 0,
+      hasSubsidy: false, subsidyLabel: null, subsidyDiscount: 0,
+    };
+  });
+  const ids = ['12345678', '23456789', '34567890'];
+  const url = id => `https://item.jd.com/${id}.html`;
+  // Save the refresh target first so a due tick sees the two other SKUs in a stable order.
+  for (const id of ids) await controller.parse(url(id));
+  visited.length = 0;
+  controller.onModuleInit();
+  setMinute(59);
+  await poll();
+  assert.deepEqual(visited, []);
+  const refreshed = await controller.refreshOne(ids[0], { get: () => undefined });
+  assert.equal(refreshed.product.priceHistory.at(-1).note, '手动刷新采集');
+  assert.deepEqual(visited.splice(0), [ids[0]]);
+
+  setMinute(60);
+  failingSku = ids[2];
+  await poll();
+  assert.deepEqual(visited.splice(0), [ids[2]]);
+  const blocked = controller.list().products.find(product => product.skuId === ids[2]);
+  assert.equal(blocked.priceHistory.length, 1);
+  assert.equal(blocked.lastAutomaticCollectionAt, new Date().toISOString());
+
+  controller.onModuleDestroy();
+  controller.onModuleInit();
+  setMinute(61);
+  await poll();
+  assert.deepEqual(visited.splice(0), [ids[1]]);
+  const polled = controller.list().products.find(product => product.skuId === ids[1]);
+  assert.equal(polled.priceHistory.at(-1).note, '自动巡检采集');
+
+  setMinute(118);
+  await poll();
+  assert.deepEqual(visited, []);
+  setMinute(119);
+  await poll();
+  assert.deepEqual(visited.splice(0), [ids[0]]);
+  setMinute(120);
+  await poll();
+  assert.deepEqual(visited, [ids[2]]);
+});
+
 test('JD uses the observed mobile quote when the page object has a trailing comma and desktop is limited', async t => {
   const identity = { platform: 'jd', id: '12345678', skuId: '12345678', canonicalUrl: 'https://item.jd.com/12345678.html' };
   const itemInfo = JSON.stringify({
