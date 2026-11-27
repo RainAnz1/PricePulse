@@ -349,7 +349,11 @@ async function scrapeJdMobileQuote(
     try {
       const response = await page.goto(mobileUrl.href, { waitUntil: 'domcontentloaded', timeout: 10500 });
       if (!response?.ok() || !onProduct()) return null;
-      await page.locator('#priceSpec #defaultDesc + span').scrollIntoViewIfNeeded({ timeout: 4000 });
+      await page.locator('#priceSpec #defaultDesc + span').evaluate(
+        value => value.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }),
+        undefined,
+        { timeout: 4000 },
+      );
       await page.waitForFunction(() => document.fonts.status === 'loaded', undefined, { timeout: 1500 });
       const quote = await page.evaluate(id => {
         const item = (window as Window & { _itemInfo?: { product?: { skuId?: string | number } } })._itemInfo;
@@ -376,6 +380,11 @@ async function scrapeJdMobileQuote(
           bottom = Math.max(bottom, r.bottom);
         }
         if (right <= left || bottom <= top) return null;
+        // The product's floating recommendations can cover a price that is inside the viewport.
+        const centerY = (top + bottom) / 2;
+        if ([0.2, 0.5, 0.8].some(ratio => !value.contains(document.elementFromPoint(left + (right - left) * ratio, centerY)))) {
+          return null;
+        }
         const x = Math.max(0, Math.floor(left));
         const y = Math.max(0, Math.floor(top) - 4);
         const width = Math.min(innerWidth, Math.ceil(right) + 2) - x;

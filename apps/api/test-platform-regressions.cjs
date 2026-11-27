@@ -498,6 +498,7 @@ test('JD uses the observed mobile quote when the page object has a trailing comm
 test('JD accepts a labeled mobile quote and leaves masked or unavailable prices pending', async t => {
   const url = 'https://item.m.jd.com/product/12345678.html';
   const visited = [];
+  const scrolls = [];
   let mobilePriceText = '¥2,898.00';
   t.mock.method(sessionModule, 'loadPersistedJdSession', () => ({
     cookies: { pt_key: 'fixture-key', pt_pin: 'fixture-pin' },
@@ -515,7 +516,11 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
         url: () => destination === url ? url : 'https://pc-frequent-pro.pf.jd.com/',
         locator(selector) {
           assert.equal(selector, '#priceSpec #defaultDesc + span');
-          return { scrollIntoViewIfNeeded: async () => {} };
+          return {
+            async evaluate(callback) {
+              callback({ scrollIntoView: options => scrolls.push(options) });
+            },
+          };
         },
         async waitForFunction() {},
         async waitForTimeout() {},
@@ -538,6 +543,7 @@ test('JD accepts a labeled mobile quote and leaves masked or unavailable prices 
   assert.equal(quote.subsidyPrice, 2898);
   assert.equal(quote.subsidyDiscount, 0);
   assert.deepEqual(visited, [url]);
+  assert.deepEqual(scrolls, [{ block: 'center', inline: 'nearest', behavior: 'instant' }]);
 
   mobilePriceText = '¥????.??';
   const pending = await scrapeJdProduct(identity, new AbortController().signal);
