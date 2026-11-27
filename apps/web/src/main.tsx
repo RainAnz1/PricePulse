@@ -39,10 +39,10 @@ interface MonitoredProduct {
   hasSubsidy: boolean;
   subsidyLabel: string | null;
   subsidyDiscount: number;
-  allTimeLow: number;
-  allTimeLowAt: string;
-  allTimeHigh: number;
-  initialPrice: number;
+  allTimeLow: number | null;
+  allTimeLowAt: string | null;
+  allTimeHigh: number | null;
+  initialPrice: number | null;
   previousFinalPrice: number | null;
   lastDropAmount: number;
   priceHistory: PriceHistoryPoint[];
@@ -111,10 +111,15 @@ function toDateInputValue(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+function isAtHistoricLow(product: MonitoredProduct): boolean {
+  return product.allTimeLow !== null && product.finalPrice > 0 && product.finalPrice <= product.allTimeLow;
+}
+
 function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
   const rawPoints = product.priceHistory || [];
+  const hasPrice = rawPoints.length > 0;
   const totalSaved = Math.max(0, Number((product.pagePrice - product.finalPrice).toFixed(2)));
-  const isAtLow = product.finalPrice <= product.allTimeLow;
+  const isAtLow = isAtHistoricLow(product);
 
   // 走势图与历史价格记录统一的时间区间筛选状态
   const [preset, setPreset] = useState<TimeRangePreset>('15d');
@@ -158,12 +163,10 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
     const startMs = startDate ? new Date(`${startDate}T00:00:00`).getTime() : 0;
     const endMs = endDate ? new Date(`${endDate}T23:59:59.999`).getTime() : Number.MAX_SAFE_INTEGER;
 
-    const matched = rawPoints.filter(pt => {
+    return rawPoints.filter(pt => {
       const t = new Date(pt.timestamp).getTime();
       return t >= startMs && t <= endMs;
     });
-    // 如果所选区间内不足 2 个点，至少保留最近的采样点保证图表可看
-    return matched.length > 0 ? matched : rawPoints.slice(-Math.min(3, rawPoints.length));
   }, [rawPoints, startDate, endDate]);
 
   // 当商品或时间筛选变化时重置滚轮缩放
@@ -259,12 +262,9 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
   const plotW = width - padLeft - padRight;
   const plotH = height - padTop - padBottom;
 
-  const allValues =
-    visiblePoints.length > 0
-      ? visiblePoints.flatMap(p => [p.finalPrice, p.pagePrice]).filter(v => v > 0)
-      : [product.finalPrice, product.pagePrice];
-  const minVal = Math.min(...allValues, product.allTimeLow);
-  const maxVal = Math.max(...allValues);
+  const allValues = visiblePoints.flatMap(p => [p.finalPrice, p.pagePrice]);
+  const minVal = allValues.length ? Math.min(...allValues, product.allTimeLow ?? Infinity) : 0;
+  const maxVal = Math.max(0, ...allValues);
   const span = Math.max(10, maxVal - minVal);
   const yMin = Math.max(0, Math.floor(minVal - span * 0.2));
   const yMax = Math.ceil(maxVal + span * 0.2);
@@ -282,7 +282,7 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
     finalCoords.length > 0
       ? `${finalPath} L ${finalCoords[finalCoords.length - 1].x.toFixed(1)} ${padTop + plotH} L ${finalCoords[0].x.toFixed(1)} ${padTop + plotH} Z`
       : '';
-  const lowY = getY(product.allTimeLow);
+  const lowY = product.allTimeLow === null ? null : getY(product.allTimeLow);
 
   // 鼠标在图表上移动时计算最近的采样点索引 + 拖拽平移
   function handleMouseMove(e: React.MouseEvent<SVGSVGElement>) {
@@ -352,42 +352,44 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
             <span>预估到手价</span>
             {isAtLow && <span className="apple-badge blue">当前史低</span>}
           </div>
-          <div className="tile-price">¥{formatPrice(product.finalPrice)}</div>
-          <div className="tile-caption">较日常标价立省 ¥{formatPrice(totalSaved)}</div>
+          <div className="tile-price">{hasPrice ? `¥${formatPrice(product.finalPrice)}` : '待采集'}</div>
+          {hasPrice && <div className="tile-caption">较日常标价立省 ¥{formatPrice(totalSaved)}</div>}
         </div>
 
         <div className="apple-metric-tile">
           <div className="tile-top">
             <span>页面日常标价</span>
           </div>
-          <div className="tile-price-sm">¥{formatPrice(product.pagePrice)}</div>
+          <div className="tile-price-sm">{hasPrice ? `¥${formatPrice(product.pagePrice)}` : '待采集'}</div>
           <div className="tile-caption">
-            史低 ¥{formatPrice(product.allTimeLow)} · 最高 ¥{formatPrice(product.allTimeHigh)}
+            {product.allTimeLow !== null && product.allTimeHigh !== null
+              ? `史低 ¥${formatPrice(product.allTimeLow)} · 最高 ¥${formatPrice(product.allTimeHigh)}`
+              : '暂无真实价格记录'}
           </div>
         </div>
 
         <div className="apple-metric-tile">
           <div className="tile-top">
             <span>优惠券减免</span>
-            {product.couponDiscount > 0 && <span className="apple-badge neutral">-¥{product.couponDiscount}</span>}
+            {hasPrice && product.couponDiscount > 0 && <span className="apple-badge neutral">-¥{product.couponDiscount}</span>}
           </div>
           <div className="tile-price-sm">
-            {product.couponPrice !== null ? `¥${formatPrice(product.couponPrice)}` : '无满减券'}
+            {product.couponPrice !== null ? `¥${formatPrice(product.couponPrice)}` : hasPrice ? '无满减券' : '待采集'}
           </div>
-          <div className="tile-caption">
+          {hasPrice && <div className="tile-caption">
             {product.coupons.length > 0 ? product.coupons.join(' · ') : '暂未检出可用店铺券'}
-          </div>
+          </div>}
         </div>
 
         <div className="apple-metric-tile">
           <div className="tile-top">
             <span>国家补贴（国补）</span>
-            {product.hasSubsidy && <span className="apple-badge green">-¥{product.subsidyDiscount}</span>}
+            {hasPrice && product.hasSubsidy && <span className="apple-badge green">-¥{product.subsidyDiscount}</span>}
           </div>
           <div className="tile-price-sm">
             {product.hasSubsidy && product.subsidyPrice !== null
               ? `¥${formatPrice(product.subsidyPrice)}`
-              : '暂不参与'}
+              : hasPrice ? '暂不参与' : '待采集'}
           </div>
           <div className="tile-caption">
             {product.hasSubsidy ? product.subsidyLabel : '当前类目未检出政府补贴'}
@@ -447,12 +449,12 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
           <div className="hud-primary">
             <span className="hud-tag">{hoverIdx !== null ? '指针盯盘价' : '最新到手价'}</span>
             <strong className="sf-mono hud-price">
-              ¥{activeHoverCoord ? formatPrice(activeHoverCoord.point.finalPrice) : formatPrice(product.finalPrice)}
+              {hasPrice ? `¥${formatPrice(activeHoverCoord?.point.finalPrice ?? product.finalPrice)}` : '待采集'}
             </strong>
-            <span className={`sf-mono hud-delta ${deltaFromStart <= 0 ? 'down' : 'up'}`}>
+            {firstPointInView && <span className={`sf-mono hud-delta ${deltaFromStart <= 0 ? 'down' : 'up'}`}>
               {deltaFromStart > 0 ? `+¥${formatPrice(deltaFromStart)}` : `¥${formatPrice(deltaFromStart)}`} (
               {deltaFromStart > 0 ? `+${deltaPercent}%` : `${deltaPercent}%`})
-            </span>
+            </span>}
           </div>
 
           {activeHoverCoord && (
@@ -495,9 +497,9 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
             <span>
               <i className="legend-indicator gray" /> 页面日常标价
             </span>
-            <span>
+            {product.allTimeLow !== null && <span>
               <i className="legend-indicator green" /> 史低基准线 (¥{formatPrice(product.allTimeLow)})
-            </span>
+            </span>}
           </div>
           <span className="block-sub">
             当前视图：{visiblePoints.length} / {filteredPoints.length} 个采样点
@@ -505,7 +507,7 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
         </div>
 
         <div className="stocks-svg-stage">
-          <svg
+          {visiblePoints.length > 0 ? <svg
             ref={svgRef}
             viewBox={`0 0 ${width} ${height}`}
             className={`apple-chart-svg ${isZoomed ? 'grab-cursor' : 'crosshair-cursor'}`}
@@ -534,7 +536,7 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
               );
             })}
 
-            <line x1={padLeft} y1={lowY} x2={width - padRight} y2={lowY} className="apple-low-line" />
+            {lowY !== null && <line x1={padLeft} y1={lowY} x2={width - padRight} y2={lowY} className="apple-low-line" />}
             {areaPath && <path d={areaPath} fill="url(#appleBlueFill)" />}
             <path d={pagePath} fill="none" className="apple-page-line" />
             <path d={finalPath} fill="none" className="apple-final-line" />
@@ -592,7 +594,9 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
                 <circle cx={activeHoverCoord.x} cy={activeHoverCoord.y} r="4.5" className="apple-dot-active" />
               </g>
             )}
-          </svg>
+          </svg> : (
+            <div className="apple-empty large">所选时间范围内暂无真实采集记录</div>
+          )}
 
           {/* 悬停浮动详情气泡 */}
           {hoverIdx !== null && activeHoverCoord && (
@@ -670,6 +674,7 @@ function ApplePriceDetail({ product }: { product: MonitoredProduct }) {
               </tr>
             </thead>
             <tbody>
+              {displayedHistory.length === 0 && <tr><td colSpan={7}>所选时间范围内暂无真实采集记录</td></tr>}
               {displayedHistory.map((pt, idx) => (
                 <tr key={idx}>
                   <td className="sf-mono">{new Date(pt.timestamp).toLocaleString('zh-CN')}</td>
@@ -1188,11 +1193,10 @@ function App() {
   const [feishuBusy, setFeishuBusy] = useState(false);
 
   function isProductDropped(item: MonitoredProduct): boolean {
-    const historyFirst = item.priceHistory?.[0]?.finalPrice ?? item.initialPrice;
+    if (item.initialPrice === null) return false;
     return (
       item.lastDropAmount > 0 ||
       item.finalPrice < item.initialPrice ||
-      item.finalPrice < historyFirst ||
       item.finalPrice < item.pagePrice
     );
   }
@@ -1217,7 +1221,7 @@ function App() {
       const dropped = isProductDropped(item);
       if (watchFilter === 'dropped') return dropped;
       if (watchFilter === 'unchanged') return !dropped;
-      if (watchFilter === 'low') return item.finalPrice <= item.allTimeLow;
+      if (watchFilter === 'low') return isAtHistoricLow(item);
       return true;
     });
   }, [products, watchSearch, watchFilter]);
@@ -1225,7 +1229,7 @@ function App() {
   const watchCounts = useMemo(() => {
     const dropped = products.filter(p => isProductDropped(p)).length;
     const unchanged = products.length - dropped;
-    const low = products.filter(p => p.finalPrice <= p.allTimeLow).length;
+    const low = products.filter(isAtHistoricLow).length;
     return { all: products.length, dropped, unchanged, low };
   }, [products]);
 
@@ -2119,7 +2123,7 @@ function App() {
                                 ) : (
                                   <span className="apple-badge neutral">未降价</span>
                                 )}
-                                {item.finalPrice <= item.allTimeLow && (
+                                {isAtHistoricLow(item) && (
                                   <span className="apple-badge blue">史低</span>
                                 )}
                               </div>
@@ -2130,8 +2134,11 @@ function App() {
                             </div>
 
                             <div className="item-price-box">
-                              <strong className="sf-mono item-final">¥{formatPrice(item.finalPrice)}</strong>
-                              <del className="sf-mono item-origin">¥{formatPrice(item.pagePrice)}</del>
+                              <strong className="sf-mono item-final">
+                                {item.priceHistory.length > 0 ? `¥${formatPrice(item.finalPrice)}` : '待采集'}
+                              </strong>
+                              {item.priceHistory.length > 0 &&
+                                <del className="sf-mono item-origin">¥{formatPrice(item.pagePrice)}</del>}
                               {item.hasSubsidy && (
                                 <span className="item-subsidy-pill">国补 -¥{item.subsidyDiscount}</span>
                               )}

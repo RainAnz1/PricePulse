@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { mkdtempSync, rmSync } = require('node:fs');
+const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { test } = require('node:test');
@@ -24,6 +24,110 @@ test('JD uses the displayed offer in either order and preserves a lower referenc
   assert.deepEqual(resolveJdPrice({ displayed: 699, quotedOffer: 659, selling: 649, original: 799 }), {
     finalPrice: 699, pagePrice: 799,
   });
+});
+
+test('saved price histories remove legacy simulations and rebuild stats from the collected samples', t => {
+  const previousRoot = process.env.LOCALAPPDATA;
+  const root = mkdtempSync(join(tmpdir(), 'pricepulse-history-'));
+  process.env.LOCALAPPDATA = root;
+  t.after(() => {
+    if (previousRoot === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousRoot;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const points = (timestamp, pagePrice, finalPrice, note) => ({
+    timestamp, pagePrice, finalPrice, note, couponPrice: null, subsidyPrice: null, inStock: true,
+  });
+  const first = points('2026-11-25T10:00:00.000Z', 130, 110, '首次添加采集');
+  const latest = points('2026-11-26T10:00:00.000Z', 120, 99, '实时巡检采集');
+  const mockNotes = ['历史参考价', '近期日常价', '每日历史巡检', '促销调价记录', '国补生效巡检', '降价触发 (-¥20)'];
+  const mocks = mockNotes.map(note => points('2026-11-27T10:00:00.000Z', 999, 1, note));
+  const legacy = {
+    key: 'taobao:123456:4321',
+    title: '现有商品',
+    historySource: 'fetched_or_realtime',
+    priceHistory: [mocks[0], first, ...mocks.slice(1, 5), latest, mocks[5]],
+    allTimeLow: 1, allTimeHigh: 999, allTimeLowAt: mocks[0].timestamp,
+    pagePrice: 999, finalPrice: 1, initialPrice: 999, previousFinalPrice: 20, lastDropAmount: 19,
+    updatedAt: mocks[5].timestamp,
+  };
+  const dir = join(root, 'PriceDrop', 'data');
+  const file = join(dir, 'products.json');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(file, JSON.stringify([legacy, { ...legacy, key: 'jd:123456:123456', priceHistory: mocks }]));
+  const controller = new ProductsController();
+
+  const [product, empty] = controller.list().products;
+  assert.equal(product.title, legacy.title);
+  assert.deepEqual(product.priceHistory, [first, latest]);
+  assert.equal(product.allTimeLow, 99);
+  assert.equal(product.allTimeLowAt, latest.timestamp);
+  assert.equal(product.allTimeHigh, 130);
+  assert.equal(product.finalPrice, 99);
+  assert.equal(product.previousFinalPrice, 110);
+  assert.equal(empty.allTimeLow, null);
+  assert.equal(empty.allTimeHigh, null);
+  assert.deepEqual(empty.priceHistory, []);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), controller.list().products);
+});
+
+test('a collected low survives the chart window and later alerts compare actual observations', async t => {
+  const previousRoot = process.env.LOCALAPPDATA;
+  const root = mkdtempSync(join(tmpdir(), 'pricepulse-rolling-history-'));
+  process.env.LOCALAPPDATA = root;
+  t.after(() => {
+    if (previousRoot === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousRoot;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const history = Array.from({ length: 180 }, (_, index) => ({
+    timestamp: new Date(Date.UTC(2026, 10, 25, 0, index)).toISOString(),
+    pagePrice: index === 0 ? 99 : 260,
+    finalPrice: index === 0 ? 99 : 260,
+    couponPrice: null,
+    subsidyPrice: null,
+    inStock: true,
+    note: index === 0 ? '首次添加采集' : '实时巡检采集',
+  }));
+  const dir = join(root, 'PriceDrop', 'data');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'products.json'), JSON.stringify([{
+    key: 'jd:12345678:12345678', historySource: 'realtime', priceHistory: history,
+    allTimeLow: 99, allTimeHigh: 260, allTimeLowAt: history[0].timestamp,
+    initialPrice: 99, pagePrice: 260, finalPrice: 260, inStock: true,
+  }]));
+
+  t.mock.method(sessionModule, 'getJdHeadlessContext', async () => { throw new Error('fixture mobile-only result'); });
+  let collectedPrice = 155;
+  const alerts = [];
+  t.mock.method(require('./dist/feishu'), 'notifyPriceDropToFeishu', async alert => {
+    alerts.push(alert);
+    return { ok: true };
+  });
+  t.mock.method(globalThis, 'fetch', async () => new Response(
+    `window._itemInfo = (${JSON.stringify({
+      product: { skuName: '京东测试商品' }, priceFloor: { ext: { jdPrice: String(collectedPrice) } },
+    })});`,
+  ));
+
+  const url = 'https://item.jd.com/12345678.html';
+  const { product } = await scrapeAndUpsertProduct(url);
+  assert.equal(product.priceHistory.length, 180);
+  assert.equal(product.priceHistory[0].timestamp, history[1].timestamp);
+  assert.equal(product.allTimeLow, 99);
+  assert.equal(product.allTimeLowAt, history[0].timestamp);
+  assert.equal(new ProductsController().list().products[0].allTimeLow, 99);
+  assert.equal(alerts[0].previousPrice, 260);
+  assert.equal(alerts[0].isNewAllTimeLow, false);
+
+  collectedPrice = 89;
+  const { product: cheaper } = await scrapeAndUpsertProduct(url);
+  assert.equal(cheaper.allTimeLow, 89);
+  assert.equal(cheaper.allTimeLowAt, cheaper.priceHistory.at(-1).timestamp);
+  assert.equal(alerts[1].previousPrice, 155);
+  assert.equal(alerts[1].isNewAllTimeLow, true);
 });
 
 test('remote login rejects cross-origin requests and allows same-origin traffic through a proxy', async () => {
@@ -184,6 +288,9 @@ test('manual Taobao verification resumes the same page and is available only to 
   const product = await controller.confirmVerification(owner);
   assert.equal(product.skuId, '4321');
   assert.equal(controller.list().products[0].finalPrice, 123);
+  assert.equal(product.priceHistory.length, 1);
+  assert.equal(product.allTimeLow, 123);
+  assert.equal(product.allTimeLowAt, product.priceHistory[0].timestamp);
   assert.equal(context.newPage.mock.callCount(), 1);
   assert.equal(page.goto.mock.callCount(), 1);
   assert.equal(page.close.mock.callCount(), 1);

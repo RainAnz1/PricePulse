@@ -17,7 +17,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Request } from 'express';
 import type { Page, Response as BrowserResponse } from 'playwright';
@@ -71,10 +71,10 @@ export interface MonitoredProduct {
   hasSubsidy: boolean;
   subsidyLabel: string | null;
   subsidyDiscount: number;
-  allTimeLow: number;
-  allTimeLowAt: string;
-  allTimeHigh: number;
-  initialPrice: number;
+  allTimeLow: number | null;
+  allTimeLowAt: string | null;
+  allTimeHigh: number | null;
+  initialPrice: number | null;
   previousFinalPrice: number | null;
   lastDropAmount: number;
   historySource: 'fetched_or_realtime' | 'realtime';
@@ -152,22 +152,77 @@ function validateOrigin(req: Request) {
   }
 }
 
+const simulatedPriceNotes = new Set(['历史参考价', '近期日常价', '每日历史巡检', '促销调价记录', '国补生效巡检']);
+
+function normalizePriceHistory(product: MonitoredProduct): MonitoredProduct {
+  const oldHistory = Array.isArray(product.priceHistory) ? product.priceHistory : [];
+  const priceHistory = oldHistory.filter(point =>
+    Number.isFinite(point?.finalPrice) && point.finalPrice > 0 &&
+    Number.isFinite(point.pagePrice) && point.pagePrice > 0 &&
+    Number.isFinite(Date.parse(point.timestamp)) &&
+    !simulatedPriceNotes.has(point.note ?? '') && !/^降价触发 \(-¥\d+\)$/.test(point.note ?? ''),
+  );
+  if (product.historySource === 'realtime' && priceHistory.length === product.priceHistory?.length) return product;
+
+  let lowPoint: PriceHistoryPoint | undefined;
+  let allTimeHigh: number | null = null;
+  for (const point of priceHistory) {
+    if (!lowPoint || point.finalPrice < lowPoint.finalPrice) lowPoint = point;
+    allTimeHigh = Math.max(allTimeHigh ?? 0, point.pagePrice);
+  }
+  const latest = priceHistory.at(-1);
+  const previous = priceHistory.at(-2);
+  return {
+    ...product,
+    pagePrice: latest?.pagePrice ?? 0,
+    couponPrice: latest?.couponPrice ?? null,
+    subsidyPrice: latest?.subsidyPrice ?? null,
+    finalPrice: latest?.finalPrice ?? 0,
+    allTimeLow: lowPoint?.finalPrice ?? null,
+    allTimeLowAt: lowPoint?.timestamp ?? null,
+    allTimeHigh,
+    initialPrice: priceHistory[0]?.finalPrice ?? null,
+    previousFinalPrice: previous?.finalPrice ?? null,
+    lastDropAmount: previous && latest ? Math.max(0, Number((previous.finalPrice - latest.finalPrice).toFixed(2))) : 0,
+    historySource: 'realtime',
+    priceHistory,
+    updatedAt: latest?.timestamp ?? product.updatedAt,
+  };
+}
+
 export function loadMonitoredProducts(): MonitoredProduct[] {
   const filePath = getProductsStorePath();
   if (!existsSync(filePath)) return [];
+  let parsed: MonitoredProduct[];
   try {
     const raw = readFileSync(filePath, 'utf-8');
-    const parsed = JSON.parse(raw) as MonitoredProduct[];
-    return Array.isArray(parsed) ? parsed : [];
+    parsed = JSON.parse(raw) as MonitoredProduct[];
   } catch {
     return [];
   }
+  if (!Array.isArray(parsed)) return [];
+
+  const products = parsed.map(normalizePriceHistory);
+  if (products.some((product, index) => product !== parsed[index])) {
+    try {
+      saveMonitoredProducts(products);
+    } catch {
+      productLogger.warn('旧价格历史已过滤，暂时无法写回商品数据文件');
+    }
+  }
+  return products;
 }
 
 export function saveMonitoredProducts(products: MonitoredProduct[]): MonitoredProduct[] {
   const filePath = getProductsStorePath();
   mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(products, null, 2), 'utf-8');
+  const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(products, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    renameSync(temporaryPath, filePath);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
   return products;
 }
 
@@ -1476,55 +1531,12 @@ async function scrapeAndSaveProduct(
     note: existing ? '实时巡检采集' : '首次添加采集',
   };
 
-  let priceHistory: PriceHistoryPoint[] = [];
-  const wasPlaceholder =
-    existing &&
-    (existing.title.startsWith('淘宝/天猫商品 #') ||
-      existing.title.startsWith('京东商品 #') ||
-      Math.abs(existing.pagePrice - scraped.pagePrice) > scraped.pagePrice * 0.35);
-
-  if (existing && existing.priceHistory.length >= 10 && !wasPlaceholder) {
-    priceHistory = [...existing.priceHistory, newPoint].slice(-180);
-  } else {
-    // 生成近 30 天历史价格参考轨迹（过去参考点均 >= 当前到手价，确保当前最低到手价不会被伪造历史点低于）
-    const basePage = scraped.pagePrice;
-    const baseCoupon = scraped.couponPrice ?? basePage;
-    const baseFinal = scraped.finalPrice;
-    const nowMs = Date.now();
-    const generated: PriceHistoryPoint[] = [];
-    const totalDays = 30;
-
-    for (let dayOffset = totalDays; dayOffset >= 1; dayOffset--) {
-      const ts = new Date(nowMs - dayOffset * 24 * 3600 * 1000).toISOString();
-      const wave = Math.max(
-        0,
-        Math.sin(dayOffset * 0.45) * 0.02 + (dayOffset > 15 ? 0.035 : dayOffset > 7 ? 0.018 : 0.006),
-      );
-      const ptPage = Number((basePage * (1 + wave)).toFixed(2));
-      const ptCoupon = scraped.couponPrice !== null ? Number((baseCoupon * (1 + wave * 0.8)).toFixed(2)) : null;
-      const ptSubsidy =
-        scraped.hasSubsidy && dayOffset <= 12
-          ? Number((baseFinal * (1 + wave * 0.4)).toFixed(2))
-          : null;
-      const ptFinal = ptSubsidy ?? ptCoupon ?? ptPage;
-      generated.push({
-        timestamp: ts,
-        pagePrice: ptPage,
-        couponPrice: ptCoupon,
-        subsidyPrice: ptSubsidy,
-        finalPrice: ptFinal,
-        inStock: true,
-        note: dayOffset <= 12 && scraped.hasSubsidy ? '国补生效巡检' : dayOffset % 5 === 0 ? '促销调价记录' : '每日历史巡检',
-      });
-    }
-    priceHistory = [...generated, newPoint];
-  }
-
-  const allFinals = priceHistory.map(p => p.finalPrice).filter(v => v > 0);
-  const allTimeLow = Math.min(...allFinals, scraped.finalPrice);
-  const allTimeHigh = Math.max(...allFinals, scraped.pagePrice);
-  const lowPoint = priceHistory.find(p => p.finalPrice === allTimeLow);
-  const previousFinalPrice = existing ? existing.finalPrice : null;
+  const priceHistory = [...(existing?.priceHistory ?? []), newPoint].slice(-180);
+  const previousLow = existing?.allTimeLow ?? null;
+  const allTimeLow = Math.min(previousLow ?? newPoint.finalPrice, newPoint.finalPrice);
+  const allTimeHigh = Math.max(existing?.allTimeHigh ?? 0, newPoint.pagePrice);
+  const allTimeLowAt = previousLow === allTimeLow ? existing?.allTimeLowAt ?? nowIso : nowIso;
+  const previousFinalPrice = existing?.priceHistory.at(-1)?.finalPrice ?? null;
   const priceDropped = previousFinalPrice !== null && scraped.finalPrice < previousFinalPrice;
   const lastDropAmount = priceDropped
     ? Number((previousFinalPrice - scraped.finalPrice).toFixed(2))
@@ -1555,12 +1567,12 @@ async function scrapeAndSaveProduct(
     subsidyLabel: scraped.subsidyLabel,
     subsidyDiscount: scraped.subsidyDiscount,
     allTimeLow,
-    allTimeLowAt: lowPoint?.timestamp || nowIso,
+    allTimeLowAt,
     allTimeHigh,
-    initialPrice: existing?.initialPrice ?? scraped.pagePrice,
+    initialPrice: existing?.initialPrice ?? newPoint.finalPrice,
     previousFinalPrice,
     lastDropAmount,
-    historySource: 'fetched_or_realtime',
+    historySource: 'realtime',
     priceHistory,
     createdAt: existing?.createdAt || nowIso,
     updatedAt: nowIso,
@@ -1589,16 +1601,16 @@ async function scrapeAndSaveProduct(
       coupons: updatedProduct.coupons,
       hasSubsidy: updatedProduct.hasSubsidy,
       subsidyLabel: updatedProduct.subsidyLabel,
-      allTimeLow: updatedProduct.allTimeLow,
-      isNewAllTimeLow: updatedProduct.finalPrice <= updatedProduct.allTimeLow,
+      allTimeLow,
+      isNewAllTimeLow: previousLow !== null && newPoint.finalPrice < previousLow,
     });
     feishuPushed = pushRes.ok;
-  } else if (existing && existing.inStock && !updatedProduct.inStock) {
+  } else if (previousFinalPrice !== null && existing?.inStock && !updatedProduct.inStock) {
     await notifyDelistToFeishu({
       platform: updatedProduct.platform,
       title: updatedProduct.title,
       url: updatedProduct.canonicalUrl,
-      lastPrice: existing.finalPrice,
+      lastPrice: previousFinalPrice,
       reason: updatedProduct.stockText,
     });
   }
