@@ -112,8 +112,6 @@ docker compose up -d --build
 
 ### 📦 公开 Docker 镜像
 
-GitHub Actions 负责类型检查、回归测试、容器冒烟测试及镜像构建。主分支构建发布到 `ghcr.io/rainanz1/pricepulse:latest`，阿里云成都镜像按版本标签同步。两处镜像均可公开拉取，部署由使用者手动执行。
-
 **中国大陆推荐 · 阿里云成都（Linux amd64）**
 
 ```bash
