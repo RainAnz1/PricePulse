@@ -65,6 +65,28 @@ interface PlatformSessionInfo {
   message: string;
 }
 
+async function fetchPlatformSessionStatus(platform: 'jd' | 'taobao'): Promise<PlatformSessionInfo> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/sessions/${platform}/status`, {
+      signal: AbortSignal.timeout(platform === 'jd' ? 18000 : 10000),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'TimeoutError') {
+      throw new Error('检查账号状态超时，请稍后重试');
+    }
+    throw new Error('暂时无法连接 PricePulse 服务器，请稍后重试');
+  }
+  if (!response.ok) {
+    throw new Error(`检查账号状态失败（HTTP ${response.status}）`);
+  }
+  const session = (await response.json().catch(() => null)) as PlatformSessionInfo | null;
+  if (!session || typeof session.state !== 'string') {
+    throw new Error('服务器返回了无法读取的账号状态');
+  }
+  return session;
+}
+
 interface JdQrCodeState {
   state: string;
   qrImage?: string;
@@ -1655,17 +1677,15 @@ function App() {
   async function checkJdSession() {
     setJdBusy(true);
     try {
-      const response = await fetch('/api/sessions/jd/check', { method: 'POST' });
-      const data = (await response.json()) as PlatformSessionInfo;
-      if (!response.ok) throw new Error(data.message);
+      const data = await fetchPlatformSessionStatus('jd');
       setJdSession(data);
       if (data.state === 'logged_in') {
         setJdQr(null);
         setShowJdAuthPanel(false);
       }
       setJdMessage(data.message || '检查完成');
-    } catch {
-      setJdMessage('无法连接本地服务');
+    } catch (error) {
+      setJdMessage(error instanceof Error ? error.message : '检查京东状态失败');
     } finally {
       setJdBusy(false);
     }
@@ -1787,17 +1807,15 @@ function App() {
   async function checkTaobaoSession() {
     setTbBusy(true);
     try {
-      const response = await fetch('/api/sessions/taobao/check', { method: 'POST' });
-      const data = (await response.json()) as PlatformSessionInfo;
-      if (!response.ok) throw new Error(data.message);
+      const data = await fetchPlatformSessionStatus('taobao');
       setTbSession(data);
       if (data.state === 'logged_in') {
         setTbQr(null);
         setShowTbAuthPanel(false);
       }
       setTbMessage(data.message || '检查完成');
-    } catch {
-      setTbMessage('无法连接本地服务');
+    } catch (error) {
+      setTbMessage(error instanceof Error ? error.message : '检查淘宝状态失败');
     } finally {
       setTbBusy(false);
     }
